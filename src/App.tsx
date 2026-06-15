@@ -4,6 +4,7 @@ import {
   Excalidraw,
   exportToBlob,
   getSceneVersion,
+  MainMenu,
   restore,
   serializeAsJSON,
   THEME,
@@ -460,6 +461,23 @@ function getCanvasBackground(theme: AppTheme) {
   return theme === "dark"
     ? DEFAULT_DARK_CANVAS_BACKGROUND
     : DEFAULT_LIGHT_CANVAS_BACKGROUND;
+}
+
+function ExcaliburMainMenu() {
+  return (
+    <MainMenu>
+      <MainMenu.DefaultItems.LoadScene />
+      <MainMenu.DefaultItems.SaveToActiveFile />
+      <MainMenu.DefaultItems.Export />
+      <MainMenu.DefaultItems.SaveAsImage />
+      <MainMenu.DefaultItems.SearchMenu />
+      <MainMenu.DefaultItems.Help />
+      <MainMenu.DefaultItems.ClearCanvas />
+      <MainMenu.Separator />
+      <MainMenu.DefaultItems.ToggleTheme />
+      <MainMenu.DefaultItems.ChangeCanvasBackground />
+    </MainMenu>
+  );
 }
 
 function normalizeColor(value?: string) {
@@ -3226,7 +3244,9 @@ function App() {
                     image: true,
                   },
                 }}
-              />
+              >
+                <ExcaliburMainMenu />
+              </Excalidraw>
               <div className="attachment-layer" aria-label="Anexos do canvas">
                 {attachments
                   .filter((attachment) => attachment.displayMode !== "native")

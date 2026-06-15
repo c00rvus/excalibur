@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent } from "react";
 import * as pdfjsLib from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
-import { File, FileImage, FileText, FileVideo } from "lucide-react";
+import { File, FileImage, FileText, FileVideo, Trash2 } from "lucide-react";
 import type { CanvasAttachment } from "./attachments";
 import { getAttachmentAssetUrl, readAttachmentBytes, readAttachmentText } from "./storage";
 
@@ -11,9 +11,12 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 type AttachmentPreviewProps = {
   attachment: CanvasAttachment;
   left: number;
+  selected: boolean;
   top: number;
   zoom: number;
+  onDelete: (attachmentId: string) => void;
   onOpen: (attachment: CanvasAttachment) => void;
+  onSelect: (attachmentId: string) => void;
   onDragHandlePointerDown: (
     event: PointerEvent<HTMLDivElement>,
     attachmentId: string,
@@ -254,19 +257,27 @@ function AttachmentPreviewBody({ attachment }: { attachment: CanvasAttachment })
 export function AttachmentPreview({
   attachment,
   left,
+  selected,
   top,
   zoom,
+  onDelete,
   onOpen,
+  onSelect,
   onDragHandlePointerDown,
 }: AttachmentPreviewProps) {
   return (
     <article
-      className={`attachment-card attachment-${attachment.displayMode}`}
+      aria-selected={selected}
+      className={`attachment-card attachment-${attachment.displayMode}${
+        selected ? " selected" : ""
+      }`}
       onDoubleClick={() => {
         if (attachment.displayMode === "icon") {
           onOpen(attachment);
         }
       }}
+      onFocus={() => onSelect(attachment.id)}
+      onPointerDownCapture={() => onSelect(attachment.id)}
       style={{
         left,
         top,
@@ -274,6 +285,7 @@ export function AttachmentPreview({
         height: attachment.height,
         transform: `scale(${zoom})`,
       }}
+      tabIndex={0}
     >
       <div
         className="attachment-titlebar"
@@ -285,6 +297,27 @@ export function AttachmentPreview({
       >
         <span>{attachment.name}</span>
         <small>{attachment.displayMode === "preview" ? "Preview" : "Arquivo"}</small>
+        <button
+          aria-label="Remover anexo"
+          className="attachment-delete-button"
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            onDelete(attachment.id);
+          }}
+          onDoubleClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onPointerDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          title="Remover anexo"
+          type="button"
+        >
+          <Trash2 size={13} />
+        </button>
       </div>
       <div className="attachment-body">
         <AttachmentPreviewBody attachment={attachment} />

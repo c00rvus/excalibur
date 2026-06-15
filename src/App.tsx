@@ -19,8 +19,8 @@ import type {
 import type { ExcalidrawElement, FileId } from "@excalidraw/excalidraw/element/types";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { openPath, openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   ChevronDown,
   Clock3,
@@ -59,20 +59,24 @@ import {
 import {
   canRenderNativeAttachmentPreview,
   NativePreviewResult,
+  NativePreviewProgress,
   renderAttachmentNativePreview,
 } from "./nativePreviews";
 import {
   attachFileBytesToProject,
   attachFileToProject,
   AttachmentAsset,
+  deleteAttachmentFile,
   deleteProject,
   getAttachmentAssetUrl,
   getStorageSettings,
   listProjects,
   loadProject,
+  openAttachmentFile,
   ProjectMetadata,
   resetStorageRoot,
   saveExport,
+  saveExportToPath,
   saveProject,
   setStorageRoot,
   StorageSettings,
@@ -92,6 +96,12 @@ type PendingAttachmentSource =
       bytes: number[];
       name: string;
     };
+
+type PreviewConversionState = {
+  fileName: string;
+  label: string;
+  progress: number;
+};
 
 type ProjectFolder = {
   id: string;
@@ -157,6 +167,21 @@ function stopFileDragEvent(event: React.DragEvent<HTMLElement>) {
   event.preventDefault();
   event.stopPropagation();
   event.nativeEvent.stopImmediatePropagation();
+}
+
+function isEditableKeyboardTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+
+  const tagName = target.tagName.toLowerCase();
+
+  return (
+    target.isContentEditable ||
+    tagName === "input" ||
+    tagName === "textarea" ||
+    tagName === "select"
+  );
 }
 
 function normalizeFolder(folder: Partial<ProjectFolder>): ProjectFolder {
@@ -480,6 +505,35 @@ async function blobToBytes(blob: Blob) {
   return Array.from(new Uint8Array(buffer));
 }
 
+function getExportExtension(format: ExportFormat) {
+  return format === "png" ? "png" : "jpg";
+}
+
+function getExportLabel(format: ExportFormat) {
+  return format === "png" ? "PNG" : "JPG";
+}
+
+function getExportMimeType(format: ExportFormat) {
+  return format === "png" ? "image/png" : "image/jpeg";
+}
+
+function getExportFileName(projectTitle: string, format: ExportFormat) {
+  return `${sanitizeFilePart(projectTitle) || "excalibur"}-${new Date()
+    .toISOString()
+    .replace(/[:.]/g, "-")}.${getExportExtension(format)}`;
+}
+
+function withExportPathExtension(path: string, format: ExportFormat) {
+  const extension = getExportExtension(format);
+  const matchingExtension = format === "png" ? /\.png$/i : /\.(jpe?g)$/i;
+
+  if (matchingExtension.test(path)) {
+    return path;
+  }
+
+  return path.replace(/\.(png|jpe?g)$/i, "") + `.${extension}`;
+}
+
 function getCanvasPayload(
   elements: readonly ExcalidrawElement[],
   appState: AppState,
@@ -703,6 +757,7 @@ function App() {
   const filesRef = useRef<BinaryFiles>(EMPTY_FILES);
   const attachmentsRef = useRef<CanvasAttachment[]>([]);
   const canvasHostRef = useRef<HTMLDivElement | null>(null);
+  const exportMenuRef = useRef<HTMLDivElement | null>(null);
   const autoSaveTimerRef = useRef<number | null>(null);
   const themeApplyTimerRef = useRef<number | null>(null);
   const activeProjectRef = useRef<ProjectMetadata | null>(null);
@@ -722,6 +777,7 @@ function App() {
   const [canvasInitialData, setCanvasInitialData] =
     useState<CanvasInitialData | null>(null);
   const [attachments, setAttachments] = useState<CanvasAttachment[]>([]);
+  const [selectedAttachmentId, setSelectedAttachmentId] = useState<string | null>(null);
   const [sceneViewport, setSceneViewport] = useState<SceneViewport>({
     scrollX: 0,
     scrollY: 0,
@@ -737,6 +793,7 @@ function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [status, setStatus] = useState("Carregando canvas");
   const [exportedPath, setExportedPath] = useState<string | null>(null);
+  const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
   const [storageSettings, setStorageSettings] =
     useState<StorageSettings | null>(null);
   const [projectPendingDelete, setProjectPendingDelete] =
@@ -758,8 +815,11 @@ function App() {
   const createProjectAfterFolderRef = useRef(false);
   const [pendingAttachment, setPendingAttachment] =
     useState<PendingAttachmentSource | null>(null);
+  const [previewConversion, setPreviewConversion] =
+    useState<PreviewConversionState | null>(null);
   const [videoPlayerAttachment, setVideoPlayerAttachment] =
     useState<CanvasAttachment | null>(null);
+  const [videoPlaybackError, setVideoPlaybackError] = useState("");
 
   const [draggedProjectId, setDraggedProjectId] = useState<string | null>(null);
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
@@ -876,11 +936,45 @@ function App() {
 
   useEffect(() => {
     attachmentsRef.current = attachments;
+    setSelectedAttachmentId((current) => {
+      if (!current || attachments.some((attachment) => attachment.id === current)) {
+        return current;
+      }
+
+      return null;
+    });
   }, [attachments]);
 
   useEffect(() => {
     isDirtyRef.current = isDirty;
   }, [isDirty]);
+
+  useEffect(() => {
+    if (!isExportMenuOpen) {
+      return;
+    }
+
+    const closeOnPointerDown = (event: PointerEvent) => {
+      const menu = exportMenuRef.current;
+
+      if (menu && event.target instanceof Node && !menu.contains(event.target)) {
+        setIsExportMenuOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsExportMenuOpen(false);
+      }
+    };
+
+    document.addEventListener("pointerdown", closeOnPointerDown);
+    document.addEventListener("keydown", closeOnEscape);
+
+    return () => {
+      document.removeEventListener("pointerdown", closeOnPointerDown);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [isExportMenuOpen]);
 
   useEffect(() => {
     const previousTheme = previousThemeRef.current;
@@ -897,6 +991,7 @@ function App() {
 
     const win = getCurrentWindow();
     win.setTheme(appTheme).catch(console.error);
+    invoke("set_titlebar_color", { theme: appTheme }).catch(console.error);
 
     let active = true;
     let unlistenFn: (() => void) | null = null;
@@ -904,6 +999,7 @@ function App() {
     win.onFocusChanged(() => {
       if (active) {
         win.setTheme(appTheme).catch(console.error);
+        invoke("set_titlebar_color", { theme: appTheme }).catch(console.error);
       }
     }).then((fn) => {
       if (active) {
@@ -924,6 +1020,31 @@ function App() {
   useEffect(() => {
     persistStoredFolders(folders);
   }, [folders]);
+
+  useEffect(() => {
+    const handleGlobalClick = (e: MouseEvent) => {
+      let target = e.target as HTMLElement | null;
+      while (target && target !== document.body) {
+        if (target.tagName === "A") {
+          const href = target.getAttribute("href");
+          if (href && (href.startsWith("http://") || href.startsWith("https://"))) {
+            if (isTauri()) {
+              e.preventDefault();
+              e.stopPropagation();
+              void openUrl(href).catch((err) => console.error("Error opening URL:", err));
+            }
+            break;
+          }
+        }
+        target = target.parentElement;
+      }
+    };
+
+    document.addEventListener("click", handleGlobalClick, true);
+    return () => {
+      document.removeEventListener("click", handleGlobalClick, true);
+    };
+  }, []);
 
   const filteredProjects = useMemo(() => {
     const normalizedQuery = query.trim().toLocaleLowerCase("pt-BR");
@@ -1085,6 +1206,7 @@ function App() {
         filesRef.current = restoredFiles;
         attachmentsRef.current = restoredAttachments;
         setAttachments(restoredAttachments);
+        setSelectedAttachmentId(null);
         syncSceneViewport(appStateRef.current);
 
         if (appStateRef.current) {
@@ -1187,6 +1309,7 @@ function App() {
     filesRef.current = EMPTY_FILES;
     attachmentsRef.current = [];
     setAttachments([]);
+    setSelectedAttachmentId(null);
     syncSceneViewport(appStateRef.current);
 
     if (appStateRef.current) {
@@ -1232,6 +1355,7 @@ function App() {
       setActiveProject(null);
       setCanvasInitialData(null);
       setAttachments([]);
+      setSelectedAttachmentId(null);
       setExportedPath(null);
       setIsDirty(false);
       setStatus(nextStatus);
@@ -1343,6 +1467,8 @@ function App() {
       return;
     }
 
+    setVideoPlaybackError("");
+
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setVideoPlayerAttachment(null);
@@ -1395,6 +1521,56 @@ function App() {
     },
     [scheduleAutoSave],
   );
+
+  const removeAttachmentById = useCallback(
+    async (attachmentId: string) => {
+      const attachment = attachmentsRef.current.find((item) => item.id === attachmentId);
+
+      if (!attachment || attachment.displayMode === "native") {
+        return;
+      }
+
+      const nextAttachments = attachmentsRef.current.filter(
+        (item) => item.id !== attachmentId,
+      );
+
+      setSelectedAttachmentId((current) =>
+        current === attachmentId ? null : current,
+      );
+      markAttachmentsChanged(nextAttachments, "Anexo removido");
+
+      try {
+        await deleteAttachmentFile(attachment.path);
+      } catch (error) {
+        console.warn("Failed to delete attachment file", error);
+      }
+    },
+    [markAttachmentsChanged],
+  );
+
+  useEffect(() => {
+    if (!selectedAttachmentId) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Delete" && event.key !== "Backspace") {
+        return;
+      }
+
+      if (isEditableKeyboardTarget(event.target)) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      void removeAttachmentById(selectedAttachmentId);
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [removeAttachmentById, selectedAttachmentId]);
 
   const insertNativeAttachmentPreview = useCallback(
     (asset: AttachmentAsset, result: NativePreviewResult) => {
@@ -1562,6 +1738,14 @@ function App() {
       setStatus("Anexando arquivo");
 
       try {
+        if (displayMode === "preview") {
+          setPreviewConversion({
+            fileName: source.name,
+            label: "Copiando arquivo",
+            progress: 3,
+          });
+        }
+
         if (isDirtyRef.current) {
           await persistProject(project);
         }
@@ -1574,9 +1758,31 @@ function App() {
         setPendingAttachment(null);
 
         if (displayMode === "preview" && canRenderNativeAttachmentPreview(asset)) {
+          const handleProgress = (progress: NativePreviewProgress) => {
+            setPreviewConversion({
+              fileName: asset.name,
+              label: progress.phase,
+              progress: progress.progress,
+            });
+            setStatus(progress.phase);
+          };
+
           setStatus("Convertendo preview local");
-          const nativePreview = await renderAttachmentNativePreview(asset);
+          setPreviewConversion({
+            fileName: asset.name,
+            label: "Convertendo preview local",
+            progress: 6,
+          });
+          const nativePreview = await renderAttachmentNativePreview(asset, {
+            onProgress: handleProgress,
+          });
+          setPreviewConversion({
+            fileName: asset.name,
+            label: "Inserindo no canvas",
+            progress: 98,
+          });
           insertNativeAttachmentPreview(asset, nativePreview);
+          setPreviewConversion(null);
           return;
         }
 
@@ -1600,6 +1806,7 @@ function App() {
       } catch (error) {
         console.error("Failed to attach file", error);
         setStatus(displayMode === "preview" ? "Erro ao gerar preview" : "Erro ao anexar arquivo");
+        setPreviewConversion(null);
       }
     },
     [
@@ -1687,11 +1894,7 @@ function App() {
 
   const handleOpenAttachment = useCallback(async (attachment: CanvasAttachment) => {
     try {
-      if (isTauri()) {
-        await openPath(attachment.path);
-      } else {
-        window.open(getAttachmentAssetUrl(attachment.path), "_blank", "noopener");
-      }
+      await openAttachmentFile(attachment.path);
     } catch {
       setStatus("Nao foi possivel abrir o arquivo");
     }
@@ -1729,12 +1932,52 @@ function App() {
     [],
   );
 
+  const handleAttachmentSelect = useCallback((attachmentId: string) => {
+    setSelectedAttachmentId(attachmentId);
+
+    const api = excalidrawApiRef.current;
+    if (!api) {
+      return;
+    }
+
+    const currentAppState = api.getAppState();
+    if (!Object.keys(currentAppState.selectedElementIds || {}).length) {
+      return;
+    }
+
+    const nextAppState = {
+      ...currentAppState,
+      selectedElementIds: {},
+    } as AppState;
+
+    api.updateScene({
+      appState: nextAppState,
+      captureUpdate: CaptureUpdateAction.NEVER,
+    });
+    appStateRef.current = nextAppState;
+  }, []);
+
+  const handleCanvasPointerDownCapture = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (
+        event.target instanceof Element &&
+        event.target.closest(".attachment-card")
+      ) {
+        return;
+      }
+
+      setSelectedAttachmentId(null);
+    },
+    [],
+  );
+
   const handleAttachmentDragStart = useCallback(
     (event: React.PointerEvent<HTMLDivElement>, attachmentId: string) => {
       if (event.button !== 0) {
         return;
       }
 
+      handleAttachmentSelect(attachmentId);
       event.preventDefault();
       event.stopPropagation();
 
@@ -1774,7 +2017,7 @@ function App() {
       window.addEventListener("pointerup", handleEnd);
       window.addEventListener("pointercancel", handleEnd);
     },
-    [markAttachmentsChanged, sceneViewport.zoom],
+    [handleAttachmentSelect, markAttachmentsChanged, sceneViewport.zoom],
   );
 
   const handleRename = useCallback(
@@ -1855,6 +2098,7 @@ function App() {
         setActiveProject(null);
         setCanvasInitialData(null);
         setAttachments([]);
+        setSelectedAttachmentId(null);
         setActiveFolderId(getProjectFolderId(project));
         setExportedPath(null);
         setIsDirty(false);
@@ -2286,7 +2530,7 @@ function App() {
     setAppTheme((current) => (current === "dark" ? "light" : "dark"));
   }, []);
 
-  const handleExport = useCallback(
+  const buildExportPayload = useCallback(
     async (format: ExportFormat) => {
       const project = activeProjectRef.current;
       const appState = appStateRef.current;
@@ -2294,14 +2538,13 @@ function App() {
 
       if (!project || !appState || !elements.length) {
         setStatus("Nada para exportar");
-        return;
+        return null;
       }
 
       clearAutoSave();
       await persistProject(project);
-      setStatus(`Exportando ${format.toUpperCase()}`);
+      setStatus(`Exportando ${getExportLabel(format)}`);
 
-      const mimeType = format === "png" ? "image/png" : "image/jpeg";
       const blob = await exportToBlob({
         elements,
         appState: {
@@ -2311,20 +2554,93 @@ function App() {
             appState.viewBackgroundColor || getCanvasBackground(appTheme),
         },
         files: filesRef.current,
-        mimeType,
+        mimeType: getExportMimeType(format),
         quality: 0.94,
         exportPadding: 24,
       });
       const bytes = await blobToBytes(blob);
-      const fileName = `${sanitizeFilePart(project.title) || "excalibur"}-${new Date()
-        .toISOString()
-        .replace(/[:.]/g, "-")}.${format === "png" ? "png" : "jpg"}`;
-      const exported = await saveExport(project.id, fileName, bytes, blob);
 
-      setExportedPath(exported.path);
-      setStatus("Exportado");
+      return {
+        blob,
+        bytes,
+        fileName: getExportFileName(project.title, format),
+        project,
+      };
     },
     [appTheme, clearAutoSave, persistProject],
+  );
+
+  const handleExport = useCallback(
+    async (format: ExportFormat) => {
+      setIsExportMenuOpen(false);
+
+      try {
+        const payload = await buildExportPayload(format);
+
+        if (!payload) {
+          return;
+        }
+
+        const exported = await saveExport(
+          payload.project.id,
+          payload.fileName,
+          payload.bytes,
+          payload.blob,
+        );
+
+        setExportedPath(exported.path);
+        setStatus("Exportado");
+      } catch (error) {
+        console.error(error);
+        setStatus("Falha ao exportar");
+      }
+    },
+    [buildExportPayload],
+  );
+
+  const handleExportToPath = useCallback(
+    async (format: ExportFormat) => {
+      setIsExportMenuOpen(false);
+
+      try {
+        const payload = await buildExportPayload(format);
+
+        if (!payload) {
+          return;
+        }
+
+        let targetPath = payload.fileName;
+
+        if (isTauri()) {
+          const selectedPath = await saveDialog({
+            defaultPath: payload.fileName,
+            filters: [
+              {
+                name: getExportLabel(format),
+                extensions: [getExportExtension(format)],
+              },
+            ],
+            title: `Exportar ${getExportLabel(format)} para`,
+          });
+
+          if (!selectedPath) {
+            setStatus("Exportacao cancelada");
+            return;
+          }
+
+          targetPath = withExportPathExtension(selectedPath, format);
+        }
+
+        const exported = await saveExportToPath(targetPath, payload.bytes, payload.blob);
+
+        setExportedPath(exported.path);
+        setStatus("Exportado");
+      } catch (error) {
+        console.error(error);
+        setStatus("Falha ao exportar");
+      }
+    },
+    [buildExportPayload],
   );
 
   const revealExport = useCallback(async () => {
@@ -2427,6 +2743,9 @@ function App() {
     : "";
   const pendingAttachmentKind = getAttachmentKindFromExtension(pendingAttachmentExtension);
   const pendingAttachmentCanPreview = canPreviewAttachment(pendingAttachmentKind);
+  const videoPlayerSource = videoPlayerAttachment
+    ? getAttachmentAssetUrl(videoPlayerAttachment.path)
+    : "";
 
   return (
     <main
@@ -2772,33 +3091,78 @@ function App() {
               <Paperclip size={16} />
               <span>Anexar</span>
             </button>
-            <button
-              className="toolbar-button"
-              disabled={!activeProject}
-              onClick={() => handleExport("png")}
-              type="button"
-            >
-              <ImageDown size={16} />
-              <span>PNG</span>
-            </button>
-            <button
-              className="toolbar-button"
-              disabled={!activeProject}
-              onClick={() => handleExport("jpeg")}
-              type="button"
-            >
-              <ImageDown size={16} />
-              <span>JPG</span>
-            </button>
-            <button
-              className="icon-button"
-              disabled={!exportedPath}
-              onClick={revealExport}
-              title="Mostrar arquivo exportado"
-              type="button"
-            >
-              <FolderOpen size={17} />
-            </button>
+            <div className="export-menu" ref={exportMenuRef}>
+              <button
+                aria-expanded={isExportMenuOpen}
+                aria-haspopup="menu"
+                className="toolbar-button export-trigger"
+                disabled={!activeProject}
+                onClick={() => setIsExportMenuOpen((current) => !current)}
+                type="button"
+              >
+                <ImageDown size={16} />
+                <span>Exportar</span>
+                <ChevronDown className="export-chevron" size={14} />
+              </button>
+              {isExportMenuOpen && activeProject ? (
+                <div className="export-menu-popover" role="menu">
+                  <button
+                    className="export-menu-item"
+                    onClick={() => void handleExport("png")}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <ImageDown size={15} />
+                    <span>PNG</span>
+                  </button>
+                  <button
+                    className="export-menu-item"
+                    onClick={() => void handleExport("jpeg")}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <ImageDown size={15} />
+                    <span>JPG</span>
+                  </button>
+                  <div className="export-menu-divider" />
+                  <button
+                    className="export-menu-item"
+                    onClick={() => void handleExportToPath("png")}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <FolderOpen size={15} />
+                    <span>PNG para...</span>
+                  </button>
+                  <button
+                    className="export-menu-item"
+                    onClick={() => void handleExportToPath("jpeg")}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <FolderOpen size={15} />
+                    <span>JPG para...</span>
+                  </button>
+                  {exportedPath ? (
+                    <>
+                      <div className="export-menu-divider" />
+                      <button
+                        className="export-menu-item"
+                        onClick={() => {
+                          setIsExportMenuOpen(false);
+                          void revealExport();
+                        }}
+                        role="menuitem"
+                        type="button"
+                      >
+                        <FolderOpen size={15} />
+                        <span>Mostrar ultimo export</span>
+                      </button>
+                    </>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
             <button
               className="icon-button danger"
               disabled={!activeProject}
@@ -2817,6 +3181,7 @@ function App() {
           onDragEnterCapture={handleCanvasFileDrag}
           onDragOverCapture={handleCanvasFileDrag}
           onDropCapture={handleCanvasFileDrop}
+          onPointerDownCapture={handleCanvasPointerDownCapture}
           ref={canvasHostRef}
         >
           {activeProject ? (
@@ -2841,6 +3206,7 @@ function App() {
                     files: EMPTY_FILES,
                   }
                 }
+                langCode="pt-BR"
                 name={activeProject.title}
                 onChange={handleCanvasChange}
                 theme={getExcalidrawTheme(appTheme)}
@@ -2869,8 +3235,13 @@ function App() {
                       attachment={attachment}
                       key={attachment.id}
                       left={attachment.x * sceneViewport.zoom + sceneViewport.scrollX}
+                      onDelete={(attachmentId) => {
+                        void removeAttachmentById(attachmentId);
+                      }}
                       onDragHandlePointerDown={handleAttachmentDragStart}
                       onOpen={handleOpenAttachment}
+                      onSelect={handleAttachmentSelect}
+                      selected={selectedAttachmentId === attachment.id}
                       top={attachment.y * sceneViewport.zoom + sceneViewport.scrollY}
                       zoom={sceneViewport.zoom}
                     />
@@ -3041,6 +3412,35 @@ function App() {
         </div>
       ) : null}
 
+      {previewConversion ? (
+        <div className="conversion-progress-backdrop">
+          <section
+            aria-label="Convertendo preview"
+            aria-live="polite"
+            className="conversion-progress-panel"
+            role="status"
+          >
+            <div className="conversion-progress-header">
+              <strong>Convertendo preview</strong>
+              <span>{previewConversion.fileName}</span>
+            </div>
+            <div
+              aria-valuemax={100}
+              aria-valuemin={0}
+              aria-valuenow={previewConversion.progress}
+              className="conversion-progress-track"
+              role="progressbar"
+            >
+              <div
+                className="conversion-progress-bar"
+                style={{ width: `${previewConversion.progress}%` }}
+              />
+            </div>
+            <small>{previewConversion.label}</small>
+          </section>
+        </div>
+      ) : null}
+
       {videoPlayerAttachment ? (
         <div
           className="video-player-backdrop"
@@ -3071,10 +3471,25 @@ function App() {
               autoPlay
               className="video-player-media"
               controls
+              key={videoPlayerAttachment.path}
+              onCanPlay={() => setVideoPlaybackError("")}
+              onError={() => {
+                setVideoPlaybackError(
+                  "Nao foi possivel reproduzir este video no app.",
+                );
+              }}
+              playsInline
               preload="metadata"
-              src={getAttachmentAssetUrl(videoPlayerAttachment.path)}
-            />
+            >
+              <source
+                src={videoPlayerSource}
+                type={videoPlayerAttachment.mimeType || undefined}
+              />
+            </video>
             <footer className="video-player-actions">
+              {videoPlaybackError ? (
+                <span className="video-player-error">{videoPlaybackError}</span>
+              ) : null}
               <button
                 className="toolbar-button"
                 onClick={() => {

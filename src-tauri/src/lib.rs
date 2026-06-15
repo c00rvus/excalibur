@@ -1,10 +1,25 @@
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::Cursor,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
+
+#[cfg(target_os = "windows")]
+use windows::{
+    core::PCWSTR,
+    Win32::{
+        Foundation::{RPC_E_CHANGED_MODE, SIZE},
+        Graphics::Gdi::{
+            CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO,
+            BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+        },
+        System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED},
+        UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK},
+    },
+};
 
 const APP_FOLDER_NAME: &str = "Excalibur";
 const CANVAS_FILE_NAME: &str = "scene.excalidraw";
@@ -15,6 +30,7 @@ const SETTINGS_FILE_NAME: &str = "settings.json";
 const MAX_TEXT_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PDF_PREVIEW_BYTES: u64 = 60 * 1024 * 1024;
 const MAX_IMAGE_PREVIEW_BYTES: u64 = 40 * 1024 * 1024;
+const MAX_VIDEO_POSTER_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,6 +82,14 @@ struct AttachmentAsset {
     mime_type: String,
     kind: String,
     size: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeVideoPoster {
+    bytes: Vec<u8>,
+    width: u32,
+    height: u32,
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -536,12 +560,19 @@ fn is_image_extension(extension: &str) -> bool {
     )
 }
 
+fn is_video_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "mp4" | "m4v" | "mov" | "webm" | "avi" | "mkv" | "wmv"
+    )
+}
+
 fn attachment_kind(extension: &str) -> &'static str {
     match extension {
         value if is_text_extension(value) => "text",
         "pdf" => "pdf",
         value if is_image_extension(value) => "image",
-        "mp4" | "m4v" | "mov" | "webm" | "avi" | "mkv" | "wmv" => "video",
+        value if is_video_extension(value) => "video",
         _ => "file",
     }
 }
@@ -571,10 +602,8 @@ fn attachment_mime_type(extension: &str) -> &'static str {
 fn is_supported_attachment(extension: &str) -> bool {
     is_text_extension(extension)
         || is_image_extension(extension)
-        || matches!(
-            extension,
-            "pdf" | "mp4" | "m4v" | "mov" | "webm" | "avi" | "mkv" | "wmv"
-        )
+        || is_video_extension(extension)
+        || extension == "pdf"
 }
 
 fn now_millis() -> u128 {
@@ -931,6 +960,8 @@ fn read_attachment_bytes(app: AppHandle, path: String) -> Result<Vec<u8>, String
         MAX_PDF_PREVIEW_BYTES
     } else if is_image_extension(&extension) {
         MAX_IMAGE_PREVIEW_BYTES
+    } else if is_video_extension(&extension) {
+        MAX_VIDEO_POSTER_BYTES
     } else {
         return Err("Este arquivo nao tem leitura binaria de preview.".to_string());
     };
@@ -940,6 +971,266 @@ fn read_attachment_bytes(app: AppHandle, path: String) -> Result<Vec<u8>, String
     }
 
     fs::read(path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_attachment_file(app: AppHandle, path: String) -> Result<(), String> {
+    let path = ensure_path_inside_storage(&app, &PathBuf::from(path.trim()))?;
+
+    if !path.is_file() {
+        return Err("Arquivo nao encontrado.".to_string());
+    }
+
+    open_path_with_system(&path)
+}
+
+#[tauri::command]
+fn create_video_poster(app: AppHandle, path: String) -> Result<NativeVideoPoster, String> {
+    let path = ensure_path_inside_storage(&app, &PathBuf::from(path.trim()))?;
+    let extension = file_extension(&path);
+
+    if !path.is_file() {
+        return Err("Arquivo nao encontrado.".to_string());
+    }
+
+    if !is_video_extension(&extension) {
+        return Err("Este arquivo nao e um video suportado.".to_string());
+    }
+
+    create_native_video_poster(&path)
+}
+
+#[cfg(target_os = "windows")]
+struct ComGuard {
+    should_uninitialize: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl ComGuard {
+    fn init() -> Result<Self, String> {
+        let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+
+        if result.is_ok() {
+            return Ok(Self {
+                should_uninitialize: true,
+            });
+        }
+
+        if result == RPC_E_CHANGED_MODE {
+            return Ok(Self {
+                should_uninitialize: false,
+            });
+        }
+
+        Err(format!("Nao foi possivel iniciar COM: {result:?}"))
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.should_uninitialize {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct BitmapGuard(HBITMAP);
+
+#[cfg(target_os = "windows")]
+impl Drop for BitmapGuard {
+    fn drop(&mut self) {
+        if !self.0 .0.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.0 .0));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct DcGuard(HDC);
+
+#[cfg(target_os = "windows")]
+impl Drop for DcGuard {
+    fn drop(&mut self) {
+        if !self.0 .0.is_null() {
+            unsafe {
+                let _ = DeleteDC(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn create_native_video_poster(path: &Path) -> Result<NativeVideoPoster, String> {
+    let _com = ComGuard::init()?;
+    let path_wide: Vec<u16> = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let factory: IShellItemImageFactory = unsafe {
+        SHCreateItemFromParsingName(PCWSTR(path_wide.as_ptr()), None)
+            .map_err(|error| error.to_string())?
+    };
+    let bitmap = unsafe {
+        factory
+            .GetImage(SIZE { cx: 1280, cy: 720 }, SIIGBF_BIGGERSIZEOK)
+            .map_err(|error| error.to_string())?
+    };
+
+    encode_hbitmap_as_png(BitmapGuard(bitmap))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn create_native_video_poster(_path: &Path) -> Result<NativeVideoPoster, String> {
+    Err("Preview nativo de video esta disponivel apenas no Windows.".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn encode_hbitmap_as_png(bitmap: BitmapGuard) -> Result<NativeVideoPoster, String> {
+    let mut bitmap_info = BITMAP::default();
+    let object_size = std::mem::size_of::<BITMAP>() as i32;
+    let object_result = unsafe {
+        GetObjectW(
+            HGDIOBJ(bitmap.0 .0),
+            object_size,
+            Some(&mut bitmap_info as *mut BITMAP as *mut _),
+        )
+    };
+
+    if object_result == 0 {
+        return Err("Nao foi possivel ler a miniatura do video.".to_string());
+    }
+
+    let width = bitmap_info.bmWidth.max(1) as u32;
+    let height = bitmap_info.bmHeight.abs().max(1) as u32;
+    let mut info = BITMAPINFO::default();
+    info.bmiHeader.biSize =
+        std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
+    info.bmiHeader.biWidth = width as i32;
+    info.bmiHeader.biHeight = -(height as i32);
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB.0;
+
+    let dc = unsafe { CreateCompatibleDC(None) };
+    if dc.0.is_null() {
+        return Err("Nao foi possivel criar o contexto da miniatura.".to_string());
+    }
+    let dc = DcGuard(dc);
+    let mut bgra = vec![0u8; width as usize * height as usize * 4];
+    let copied_lines = unsafe {
+        GetDIBits(
+            dc.0,
+            bitmap.0,
+            0,
+            height,
+            Some(bgra.as_mut_ptr() as *mut _),
+            &mut info,
+            DIB_RGB_COLORS,
+        )
+    };
+
+    if copied_lines == 0 {
+        return Err("Nao foi possivel copiar a miniatura do video.".to_string());
+    }
+
+    let has_alpha = bgra.chunks_exact(4).any(|pixel| pixel[3] != 0);
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+        if !has_alpha {
+            pixel[3] = 255;
+        }
+    }
+
+    let bytes = encode_png_rgba(width, height, &bgra)?;
+
+    Ok(NativeVideoPoster {
+        bytes,
+        width,
+        height,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn encode_png_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    let mut cursor = Cursor::new(&mut bytes);
+    {
+        let mut encoder = png::Encoder::new(&mut cursor, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|error| error.to_string())?;
+        writer
+            .write_image_data(rgba)
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(bytes)
+}
+
+#[cfg(target_os = "windows")]
+fn open_path_with_system(path: &Path) -> Result<(), String> {
+    let shell_path = windows_shell_path(path);
+
+    std::process::Command::new("cmd")
+        .args(["/C", "start", ""])
+        .arg(shell_path)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_shell_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        value.into_owned()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_path_with_system(path: &Path) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(path)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_path_with_system(path: &Path) -> Result<(), String> {
+    std::process::Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_attachment_file(app: AppHandle, path: String) -> Result<(), String> {
+    let path = ensure_path_inside_storage(&app, &PathBuf::from(path.trim()))?;
+
+    if path.is_file() {
+        fs::remove_file(path).map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -967,6 +1258,68 @@ fn save_export(
     })
 }
 
+#[tauri::command]
+fn save_export_to_path(path: String, bytes: Vec<u8>) -> Result<ExportedFile, String> {
+    let path = PathBuf::from(path.trim());
+
+    if path.as_os_str().is_empty() {
+        return Err("Caminho de exportacao ausente.".to_string());
+    }
+
+    let extension = file_extension(&path);
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
+        return Err("Formato de exportacao nao suportado.".to_string());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+
+    fs::write(&path, bytes).map_err(|error| error.to_string())?;
+
+    Ok(ExportedFile {
+        path: path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+fn set_titlebar_color(window: tauri::Window, theme: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE};
+
+        let hwnd = window.hwnd().map_err(|e| e.to_string())?;
+
+        let is_dark = theme == "dark";
+        
+        let dark_mode: i32 = if is_dark { 1 } else { 0 };
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &dark_mode as *const _ as *const _,
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
+
+        let color: u32 = if is_dark {
+            0x00212121
+        } else {
+            0x00eef0f0
+        };
+
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_CAPTION_COLOR,
+                &color as *const _ as *const _,
+                std::mem::size_of::<u32>() as u32,
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -987,7 +1340,12 @@ pub fn run() {
             attach_file_bytes,
             read_attachment_text,
             read_attachment_bytes,
-            save_export
+            open_attachment_file,
+            create_video_poster,
+            delete_attachment_file,
+            save_export,
+            save_export_to_path,
+            set_titlebar_color
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

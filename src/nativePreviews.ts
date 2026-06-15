@@ -2,6 +2,7 @@ import * as pdfjsLib from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
 import type { AttachmentAsset } from "./storage";
 import {
+  createVideoPoster,
   getAttachmentAssetUrl,
   readAttachmentBytes,
   readAttachmentText,
@@ -17,6 +18,7 @@ const TEXT_FONT_SIZE = 24;
 const TEXT_LINE_HEIGHT = 34;
 const MAX_NATIVE_PREVIEW_PAGES = 60;
 const MAX_IMAGE_CANVAS_EDGE = 1800;
+const MAX_VIDEO_BLOB_PREVIEW_BYTES = 256 * 1024 * 1024;
 const VIDEO_POSTER_WIDTH = 1280;
 const VIDEO_POSTER_HEIGHT = 720;
 
@@ -33,6 +35,22 @@ export type NativePreviewResult = {
   truncated: boolean;
 };
 
+export type NativePreviewProgress = {
+  phase: string;
+  progress: number;
+  current?: number;
+  total?: number;
+};
+
+export type NativePreviewOptions = {
+  onProgress?: (progress: NativePreviewProgress) => void;
+};
+
+type ProgressRange = {
+  start: number;
+  end: number;
+};
+
 export function canRenderNativeAttachmentPreview(asset: AttachmentAsset) {
   return (
     asset.kind === "text" ||
@@ -40,6 +58,30 @@ export function canRenderNativeAttachmentPreview(asset: AttachmentAsset) {
     asset.kind === "image" ||
     asset.kind === "video"
   );
+}
+
+function reportProgress(
+  options: NativePreviewOptions | undefined,
+  progress: NativePreviewProgress,
+) {
+  options?.onProgress?.({
+    ...progress,
+    progress: Math.max(0, Math.min(100, Math.round(progress.progress))),
+  });
+}
+
+function mapProgressToRange(progress: number, range?: ProgressRange) {
+  if (!range) {
+    return progress;
+  }
+
+  return range.start + (progress / 100) * (range.end - range.start);
+}
+
+function yieldToBrowser() {
+  return new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
 }
 
 function createCanvas(width: number, height: number) {
@@ -179,8 +221,15 @@ function renderTextPage(
   };
 }
 
-async function renderTextPreview(asset: AttachmentAsset): Promise<NativePreviewResult> {
+async function renderTextPreview(
+  asset: AttachmentAsset,
+  options?: NativePreviewOptions,
+): Promise<NativePreviewResult> {
+  reportProgress(options, { phase: "Lendo texto", progress: 8 });
   const text = await readAttachmentText(asset.path);
+  reportProgress(options, { phase: "Preparando paginas", progress: 18 });
+  await yieldToBrowser();
+
   const lines = getWrappedTextLines(text);
   const linesPerPage = Math.floor(
     (TEXT_PAGE_HEIGHT - TEXT_PAGE_PADDING * 2 - TEXT_HEADER_HEIGHT) /
@@ -191,6 +240,13 @@ async function renderTextPreview(asset: AttachmentAsset): Promise<NativePreviewR
   const pages: NativePreviewPage[] = [];
 
   for (let pageIndex = 0; pageIndex < renderedPageCount; pageIndex += 1) {
+    reportProgress(options, {
+      phase: `Convertendo pagina ${pageIndex + 1} de ${renderedPageCount}`,
+      progress: 22 + ((pageIndex + 1) / renderedPageCount) * 70,
+      current: pageIndex + 1,
+      total: renderedPageCount,
+    });
+    await yieldToBrowser();
     pages.push(
       renderTextPage(
         lines.slice(pageIndex * linesPerPage, (pageIndex + 1) * linesPerPage),
@@ -201,6 +257,8 @@ async function renderTextPreview(asset: AttachmentAsset): Promise<NativePreviewR
     );
   }
 
+  reportProgress(options, { phase: "Finalizando preview", progress: 96 });
+
   return {
     pages,
     sourcePageCount,
@@ -208,8 +266,13 @@ async function renderTextPreview(asset: AttachmentAsset): Promise<NativePreviewR
   };
 }
 
-async function renderPdfPreview(asset: AttachmentAsset): Promise<NativePreviewResult> {
+async function renderPdfPreview(
+  asset: AttachmentAsset,
+  options?: NativePreviewOptions,
+): Promise<NativePreviewResult> {
+  reportProgress(options, { phase: "Lendo PDF", progress: 6 });
   const bytes = await readAttachmentBytes(asset.path);
+  reportProgress(options, { phase: "Abrindo PDF", progress: 14 });
   const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(bytes) });
   const pages: NativePreviewPage[] = [];
 
@@ -218,6 +281,14 @@ async function renderPdfPreview(asset: AttachmentAsset): Promise<NativePreviewRe
     const renderedPageCount = Math.min(pdf.numPages, MAX_NATIVE_PREVIEW_PAGES);
 
     for (let pageNumber = 1; pageNumber <= renderedPageCount; pageNumber += 1) {
+      reportProgress(options, {
+        phase: `Renderizando pagina ${pageNumber} de ${renderedPageCount}`,
+        progress: 18 + (pageNumber / renderedPageCount) * 76,
+        current: pageNumber,
+        total: renderedPageCount,
+      });
+      await yieldToBrowser();
+
       const page = await pdf.getPage(pageNumber);
       const baseViewport = page.getViewport({ scale: 1 });
       const renderScale = Math.min(
@@ -253,6 +324,8 @@ async function renderPdfPreview(asset: AttachmentAsset): Promise<NativePreviewRe
       });
     }
 
+    reportProgress(options, { phase: "Finalizando preview", progress: 96 });
+
     return {
       pages,
       sourcePageCount: pdf.numPages,
@@ -272,7 +345,26 @@ function loadImageFromUrl(url: string) {
   });
 }
 
-async function renderImagePreview(asset: AttachmentAsset): Promise<NativePreviewResult> {
+function bytesToDataUrl(bytes: number[], mimeType: string) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+      } else {
+        reject(new Error("Nao foi possivel converter o arquivo."));
+      }
+    };
+    reader.onerror = () => reject(new Error("Nao foi possivel converter o arquivo."));
+    reader.readAsDataURL(new Blob([new Uint8Array(bytes)], { type: mimeType }));
+  });
+}
+
+async function renderImagePreview(
+  asset: AttachmentAsset,
+  options?: NativePreviewOptions,
+): Promise<NativePreviewResult> {
+  reportProgress(options, { phase: "Lendo imagem", progress: 12 });
   const bytes = await readAttachmentBytes(asset.path);
   const blob = new Blob([new Uint8Array(bytes)], {
     type: asset.mimeType || "application/octet-stream",
@@ -280,7 +372,11 @@ async function renderImagePreview(asset: AttachmentAsset): Promise<NativePreview
   const url = URL.createObjectURL(blob);
 
   try {
+    reportProgress(options, { phase: "Carregando imagem", progress: 32 });
     const image = await loadImageFromUrl(url);
+    reportProgress(options, { phase: "Convertendo imagem", progress: 62 });
+    await yieldToBrowser();
+
     const naturalWidth = image.naturalWidth || image.width || 1;
     const naturalHeight = image.naturalHeight || image.height || 1;
     const scale = Math.min(
@@ -299,6 +395,8 @@ async function renderImagePreview(asset: AttachmentAsset): Promise<NativePreview
     fillCanvasBackground(context, width, height);
     context.drawImage(image, 0, 0, width, height);
 
+    reportProgress(options, { phase: "Finalizando preview", progress: 96 });
+
     return {
       pages: [
         {
@@ -314,6 +412,32 @@ async function renderImagePreview(asset: AttachmentAsset): Promise<NativePreview
   } finally {
     URL.revokeObjectURL(url);
   }
+}
+
+async function renderNativeVideoPosterPreview(
+  asset: AttachmentAsset,
+  options?: NativePreviewOptions,
+): Promise<NativePreviewResult> {
+  reportProgress(options, { phase: "Gerando miniatura no Windows", progress: 18 });
+  const poster = await createVideoPoster(asset.path);
+  reportProgress(options, { phase: "Preparando miniatura", progress: 72 });
+  await yieldToBrowser();
+  const dataURL = await bytesToDataUrl(poster.bytes, "image/png");
+
+  reportProgress(options, { phase: "Finalizando preview", progress: 96 });
+
+  return {
+    pages: [
+      {
+        dataURL,
+        width: poster.width,
+        height: poster.height,
+        mimeType: "image/png",
+      },
+    ],
+    sourcePageCount: 1,
+    truncated: false,
+  };
 }
 
 function waitForVideoEvent(
@@ -406,25 +530,45 @@ function drawVideoFallbackPoster(asset: AttachmentAsset) {
   };
 }
 
-async function renderVideoPosterPreview(asset: AttachmentAsset): Promise<NativePreviewResult> {
+async function renderVideoPosterFromSource(
+  sourceUrl: string,
+  options?: NativePreviewOptions,
+  progressRange?: ProgressRange,
+): Promise<NativePreviewResult> {
   const video = document.createElement("video");
-  const sourceUrl = getAttachmentAssetUrl(asset.path);
 
-  video.crossOrigin = "anonymous";
   video.muted = true;
   video.playsInline = true;
-  video.preload = "metadata";
+  video.preload = "auto";
   video.src = sourceUrl;
 
   try {
+    reportProgress(options, {
+      phase: "Carregando video",
+      progress: mapProgressToRange(14, progressRange),
+    });
     video.load();
     await waitForVideoEvent(video, "loadedmetadata", 8_000);
+    reportProgress(options, {
+      phase: "Lendo frame do video",
+      progress: mapProgressToRange(34, progressRange),
+    });
     await waitForVideoEvent(video, "loadeddata", 5_000).catch(() => undefined);
 
     if (Number.isFinite(video.duration) && video.duration > 0.35) {
+      reportProgress(options, {
+        phase: "Buscando frame do video",
+        progress: mapProgressToRange(48, progressRange),
+      });
       video.currentTime = Math.min(0.35, video.duration / 3);
       await waitForVideoEvent(video, "seeked", 4_000).catch(() => undefined);
     }
+
+    reportProgress(options, {
+      phase: "Convertendo poster",
+      progress: mapProgressToRange(70, progressRange),
+    });
+    await yieldToBrowser();
 
     const naturalWidth = video.videoWidth || VIDEO_POSTER_WIDTH;
     const naturalHeight = video.videoHeight || VIDEO_POSTER_HEIGHT;
@@ -445,6 +589,11 @@ async function renderVideoPosterPreview(asset: AttachmentAsset): Promise<NativeP
     context.drawImage(video, 0, 0, width, height);
     drawVideoPlayBadge(context, width, height);
 
+    reportProgress(options, {
+      phase: "Finalizando preview",
+      progress: mapProgressToRange(96, progressRange),
+    });
+
     return {
       pages: [
         {
@@ -457,12 +606,6 @@ async function renderVideoPosterPreview(asset: AttachmentAsset): Promise<NativeP
       sourcePageCount: 1,
       truncated: false,
     };
-  } catch {
-    return {
-      pages: [drawVideoFallbackPoster(asset)],
-      sourcePageCount: 1,
-      truncated: false,
-    };
   } finally {
     video.pause();
     video.removeAttribute("src");
@@ -470,23 +613,80 @@ async function renderVideoPosterPreview(asset: AttachmentAsset): Promise<NativeP
   }
 }
 
+async function createVideoBlobUrl(asset: AttachmentAsset, options?: NativePreviewOptions) {
+  reportProgress(options, { phase: "Lendo video local", progress: 42 });
+  const bytes = await readAttachmentBytes(asset.path);
+  const blob = new Blob([new Uint8Array(bytes)], {
+    type: asset.mimeType || "application/octet-stream",
+  });
+
+  return URL.createObjectURL(blob);
+}
+
+async function renderVideoPosterPreview(
+  asset: AttachmentAsset,
+  options?: NativePreviewOptions,
+): Promise<NativePreviewResult> {
+  try {
+    return await renderNativeVideoPosterPreview(asset, options);
+  } catch (error) {
+    console.warn("Failed to create native Windows video poster", error);
+  }
+
+  try {
+    return await renderVideoPosterFromSource(
+      getAttachmentAssetUrl(asset.path),
+      options,
+    );
+  } catch (error) {
+    console.warn("Failed to create video poster from asset URL", error);
+  }
+
+  if (asset.size <= MAX_VIDEO_BLOB_PREVIEW_BYTES) {
+    let blobUrl = "";
+
+    try {
+      reportProgress(options, { phase: "Preparando poster local", progress: 38 });
+      blobUrl = await createVideoBlobUrl(asset, options);
+      return await renderVideoPosterFromSource(blobUrl, options, {
+        start: 48,
+        end: 96,
+      });
+    } catch (error) {
+      console.warn("Failed to create video poster from blob URL", error);
+    } finally {
+      if (blobUrl) {
+        URL.revokeObjectURL(blobUrl);
+      }
+    }
+  }
+
+  reportProgress(options, { phase: "Criando poster alternativo", progress: 78 });
+  return {
+    pages: [drawVideoFallbackPoster(asset)],
+    sourcePageCount: 1,
+    truncated: false,
+  };
+}
+
 export async function renderAttachmentNativePreview(
   asset: AttachmentAsset,
+  options?: NativePreviewOptions,
 ): Promise<NativePreviewResult> {
   if (asset.kind === "text") {
-    return renderTextPreview(asset);
+    return renderTextPreview(asset, options);
   }
 
   if (asset.kind === "pdf") {
-    return renderPdfPreview(asset);
+    return renderPdfPreview(asset, options);
   }
 
   if (asset.kind === "image") {
-    return renderImagePreview(asset);
+    return renderImagePreview(asset, options);
   }
 
   if (asset.kind === "video") {
-    return renderVideoPosterPreview(asset);
+    return renderVideoPosterPreview(asset, options);
   }
 
   throw new Error("Este tipo de arquivo nao tem preview nativo.");

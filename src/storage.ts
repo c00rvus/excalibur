@@ -30,6 +30,12 @@ export type AttachmentAsset = {
   size: number;
 };
 
+export type NativeVideoPoster = {
+  bytes: number[];
+  width: number;
+  height: number;
+};
+
 export type StorageSettings = {
   storageRoot: string;
   defaultStorageRoot: string;
@@ -66,6 +72,10 @@ function downloadBlob(blob: Blob, fileName: string) {
   anchor.click();
 
   window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
+function getFileNameFromSavePath(path: string) {
+  return path.split(/[\\/]/).pop() || "excalibur-export.png";
 }
 
 export async function listProjects(): Promise<ProjectMetadata[]> {
@@ -134,6 +144,19 @@ export async function saveExport(
   return { path: fileName };
 }
 
+export async function saveExportToPath(
+  path: string,
+  bytes: number[],
+  blob: Blob,
+): Promise<ExportedFile> {
+  if (isTauri()) {
+    return invoke<ExportedFile>("save_export_to_path", { path, bytes });
+  }
+
+  downloadBlob(blob, getFileNameFromSavePath(path));
+  return { path };
+}
+
 export async function attachFileToProject(
   projectId: string,
   sourcePath: string,
@@ -171,6 +194,31 @@ export async function readAttachmentBytes(path: string): Promise<number[]> {
   }
 
   return invoke<number[]>("read_attachment_bytes", { path });
+}
+
+export async function deleteAttachmentFile(path: string): Promise<void> {
+  if (!isTauri()) {
+    return;
+  }
+
+  return invoke<void>("delete_attachment_file", { path });
+}
+
+export async function openAttachmentFile(path: string): Promise<void> {
+  if (!isTauri()) {
+    window.open(getAttachmentAssetUrl(path), "_blank", "noopener");
+    return;
+  }
+
+  return invoke<void>("open_attachment_file", { path });
+}
+
+export async function createVideoPoster(path: string): Promise<NativeVideoPoster> {
+  if (!isTauri()) {
+    throw new Error("Preview nativo de video esta disponivel no app desktop.");
+  }
+
+  return invoke<NativeVideoPoster>("create_video_poster", { path });
 }
 
 export function getAttachmentAssetUrl(path: string) {

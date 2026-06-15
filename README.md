@@ -5,14 +5,15 @@ Vite, and the official Excalidraw canvas package.
 
 ## Features
 
-- Local sidebar with folders, projects/canvases, create, rename, switch,
-  search, and delete.
-- Excalidraw canvas tools for shapes, arrows, free draw, text, frames, images,
-  zoom, selection, undo/redo, and built-in scene actions.
-- Autosave to the Windows Documents folder by default, with a configurable
-  storage root and a small metadata index for fast project listing.
-- Export active boards to PNG or JPG.
-- Desktop runtime through Windows WebView2 instead of Electron.
+- **Local Sidebar Organization:** Manage folders and canvases/projects with support for creating, renaming, switching, searching, and deleting.
+- **Drag & Drop Workspace:** Move canvases between folders by dragging them directly in the sidebar, or reorder them within a folder to organize your workflow. Folder movements on the OS filesystem level are processed instantly and safely by the Rust backend.
+- **Custom Folder Colors:** Personalize each folder with a modern color palette from a custom picker, allowing for quick visual recognition in the sidebar.
+- **Excalidraw Tools:** Full support for shapes, arrows, free drawing, sticky notes, text, frames, image imports, zoom, selection, undo/redo, and built-in scene actions.
+- **Native Titlebar Color Sync:** On Windows, the native window titlebar automatically synchronizes and matches the sidebar's background color, adjusting instantly for both light and dark themes.
+- **External Web Redirection:** External links and the Excalidraw library finder button automatically open in your default system web browser, allowing you to easily browse, download, and import libraries.
+- **Autosave & Customizable Path:** Saves progress automatically to the disk. Uses `%USERPROFILE%\Documents\Excalibur` by default, but the storage path can be customized through the settings panel.
+- **Export Options:** Easily export active boards to high-quality PNG or JPG files.
+- **Lightweight Runtime:** Powered by Tauri and Windows WebView2 instead of Electron, utilizing minimal system resources.
 
 ## Windows Development
 

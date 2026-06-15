@@ -3353,6 +3353,45 @@ function App() {
                 <code>projects\\pasta\\canvas\\exports\\png</code>
                 <code>projects\\pasta\\canvas\\exports\\jpg</code>
               </div>
+
+              <div className="settings-section license-credits" style={{ borderTop: "1px solid var(--border-color)", paddingTop: "14px", marginTop: "14px" }}>
+                <span>Sobre & Licenças</span>
+                <p style={{ fontSize: "12.5px", margin: "6px 0", color: "var(--text-muted)", lineHeight: "1.4" }}>
+                  Este projeto utiliza o <strong>Excalidraw</strong>, que é publicado sob a licença MIT.
+                </p>
+                <div style={{ display: "flex", gap: "16px", marginTop: "8px" }}>
+                  <a
+                    href="https://github.com/excalidraw/excalidraw"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => {
+                      if (isTauri()) {
+                        e.preventDefault();
+                        void openUrl("https://github.com/excalidraw/excalidraw").catch(console.error);
+                      }
+                    }}
+                    style={{ fontSize: "12px", color: "var(--accent)", textDecoration: "none", display: "flex", alignItems: "center", gap: "4px", fontWeight: 500 }}
+                  >
+                    <ExternalLink size={12} />
+                    <span>Excalidraw GitHub</span>
+                  </a>
+                  <a
+                    href="https://github.com/excalidraw/excalidraw/blob/master/LICENSE"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => {
+                      if (isTauri()) {
+                        e.preventDefault();
+                        void openUrl("https://github.com/excalidraw/excalidraw/blob/master/LICENSE").catch(console.error);
+                      }
+                    }}
+                    style={{ fontSize: "12px", color: "var(--accent)", textDecoration: "none", display: "flex", alignItems: "center", gap: "4px", fontWeight: 500 }}
+                  >
+                    <ExternalLink size={12} />
+                    <span>Licença MIT</span>
+                  </a>
+                </div>
+              </div>
             </div>
           </section>
         </div>

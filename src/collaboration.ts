@@ -10,6 +10,7 @@ export type CollaborationSessionInfo = {
   code?: string | null;
   endpoints: string[];
   peerCount: number;
+  readOnly: boolean;
   initialPayload?: string | null;
 };
 
@@ -17,6 +18,7 @@ export type CollaborationEvent = {
   kind:
     | "started"
     | "connected"
+    | "joinRequest"
     | "peerConnected"
     | "peerDisconnected"
     | "sceneUpdate"
@@ -25,14 +27,23 @@ export type CollaborationEvent = {
   role?: CollaborationRole | null;
   sessionId?: string | null;
   canvasId?: string | null;
+  requestId?: string | null;
+  peerId?: string | null;
+  readOnly?: boolean | null;
   payload?: string | null;
   peerCount?: number | null;
   message?: string | null;
 };
 
+export type CollaborationStartOptions = {
+  requireApproval: boolean;
+  defaultReadOnly: boolean;
+};
+
 export async function startCollaborationSession(
   canvasId: string,
   initialPayload: string,
+  options: CollaborationStartOptions,
 ) {
   if (!isTauri()) {
     throw new Error("Colaboracao P2P esta disponivel no app desktop.");
@@ -41,6 +52,7 @@ export async function startCollaborationSession(
   return invoke<CollaborationSessionInfo>("start_collaboration_session", {
     canvasId,
     initialPayload,
+    options,
   });
 }
 
@@ -58,6 +70,22 @@ export async function stopCollaborationSession() {
   }
 
   return invoke<void>("stop_collaboration_session");
+}
+
+export async function respondCollaborationJoinRequest(
+  requestId: string,
+  approved: boolean,
+  readOnly: boolean,
+) {
+  if (!isTauri()) {
+    return;
+  }
+
+  return invoke<void>("respond_collaboration_join_request", {
+    requestId,
+    approved,
+    readOnly,
+  });
 }
 
 export async function sendCollaborationUpdate(payload: string) {

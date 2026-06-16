@@ -48,9 +48,11 @@ import {
   Save,
   Search,
   Settings,
+  ShieldCheck,
   Sun,
   Trash2,
   Users,
+  Eye,
   WifiOff,
   X,
 } from "lucide-react";
@@ -99,6 +101,7 @@ import {
   getCollaborationDebugLogPath,
   getCollaborationStatus,
   joinCollaborationSession,
+  respondCollaborationJoinRequest,
   sendCollaborationUpdate,
   startCollaborationSession,
   stopCollaborationSession,
@@ -134,7 +137,16 @@ type CollaborationUiState = {
   peerId?: string;
   code?: string;
   peerCount?: number;
+  readOnly?: boolean;
   message?: string;
+};
+
+type PendingCollaborationRequest = {
+  requestId: string;
+  peerId: string;
+  message: string;
+  defaultReadOnly: boolean;
+  createdAt: number;
 };
 
 function isGuestCollaborationState(state: CollaborationUiState) {
@@ -1036,6 +1048,7 @@ function getCollaborationStateFromInfo(
     peerId: info.peerId,
     code: info.code ?? undefined,
     peerCount: info.peerCount,
+    readOnly: info.readOnly,
     message: status === "hosting" ? "Colaboracao ativa" : "Conectado ao host",
   };
 }
@@ -1134,6 +1147,11 @@ function App() {
   const [collaboration, setCollaboration] = useState<CollaborationUiState>({
     status: "idle",
   });
+  const [collaborationRequireApproval, setCollaborationRequireApproval] = useState(true);
+  const [collaborationDefaultReadOnly, setCollaborationDefaultReadOnly] = useState(false);
+  const [pendingCollaborationRequests, setPendingCollaborationRequests] = useState<
+    PendingCollaborationRequest[]
+  >([]);
   const [collaborationLogPath, setCollaborationLogPath] = useState<string | null>(null);
   const [storageSettings, setStorageSettings] =
     useState<StorageSettings | null>(null);
@@ -1528,10 +1546,11 @@ function App() {
 
     if (
       applyingRemoteSceneRef.current ||
+      current.readOnly ||
       (current.status !== "hosting" && current.status !== "connected")
     ) {
       logCollaborationDebug(
-        `send_skip status=${current.status} role=${current.role ?? "none"} applyingRemote=${applyingRemoteSceneRef.current}`,
+        `send_skip status=${current.status} role=${current.role ?? "none"} readOnly=${current.readOnly ?? false} applyingRemote=${applyingRemoteSceneRef.current}`,
       );
       return;
     }
@@ -1574,7 +1593,10 @@ function App() {
   const scheduleCollaborationUpdate = useCallback(() => {
     const current = collaborationStateRef.current;
 
-    if (current.status !== "hosting" && current.status !== "connected") {
+    if (
+      current.readOnly ||
+      (current.status !== "hosting" && current.status !== "connected")
+    ) {
       return;
     }
 
@@ -1603,6 +1625,7 @@ function App() {
     lastCollaborationFilesSignatureRef.current = "";
     localElementLocksRef.current = {};
     remoteElementLocksRef.current = {};
+    setPendingCollaborationRequests([]);
     setCollaboration({ status: "idle" });
     setJoinCode("");
   }, [clearCollaborationUpdate]);
@@ -1884,6 +1907,37 @@ function App() {
         theme: getExcalidrawTheme(appTheme),
       } as AppState;
       const currentCollaboration = collaborationStateRef.current;
+
+      if (
+        currentCollaboration.readOnly &&
+        currentCollaboration.role === "guest" &&
+        !applyingRemoteSceneRef.current
+      ) {
+        const changedIds = getChangedElementIds(previousElements, elements);
+
+        if (changedIds.size) {
+          const api = excalidrawApiRef.current;
+          elementsRef.current = previousElements;
+          appStateRef.current = themedAppState;
+          filesRef.current = files;
+          syncSceneViewport(themedAppState);
+
+          if (api) {
+            api.updateScene({
+              elements: previousElements,
+              appState: themedAppState,
+              captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+            });
+            api.refresh();
+          }
+
+          setStatus("Somente visualizacao");
+          logCollaborationDebug(
+            `local_change_blocked reason=read_only changedElements=${Array.from(changedIds).join(",")}`,
+          );
+          return;
+        }
+      }
 
       if (
         !applyingRemoteSceneRef.current &&
@@ -2235,8 +2289,12 @@ function App() {
       logCollaborationDebug(
         `start_ui_request canvas=${project.id} ${summarizeCollaborationPayload(payload)}`,
       );
-      const info = await startCollaborationSession(project.id, payload);
+      const info = await startCollaborationSession(project.id, payload, {
+        requireApproval: collaborationRequireApproval,
+        defaultReadOnly: collaborationDefaultReadOnly,
+      });
       lastCollaborationFilesSignatureRef.current = getFilesSignature(filesRef.current);
+      setPendingCollaborationRequests([]);
       setCollaboration(getCollaborationStateFromInfo(info, "hosting"));
       setIsCollaborationOpen(true);
       setStatus("Colaboracao ativa");
@@ -2253,7 +2311,7 @@ function App() {
         message: error instanceof Error ? error.message : "Nao foi possivel iniciar.",
       });
     }
-  }, [getCurrentCollaborationPayload]);
+  }, [collaborationDefaultReadOnly, collaborationRequireApproval, getCurrentCollaborationPayload]);
 
   const handleJoinCollaboration = useCallback(async () => {
     const code = joinCode.trim();
@@ -2327,6 +2385,7 @@ function App() {
       localElementLocksRef.current = {};
       remoteElementLocksRef.current = {};
       setCollaboration({ status: "idle" });
+      setPendingCollaborationRequests([]);
       setJoinCode("");
       setStatus("Colaboracao encerrada");
 
@@ -2383,6 +2442,42 @@ function App() {
     }
   }, []);
 
+  const handleRespondCollaborationRequest = useCallback(
+    async (
+      request: PendingCollaborationRequest,
+      approved: boolean,
+      readOnly: boolean,
+    ) => {
+      setPendingCollaborationRequests((current) =>
+        current.filter((item) => item.requestId !== request.requestId),
+      );
+
+      try {
+        await respondCollaborationJoinRequest(request.requestId, approved, readOnly);
+        setCollaboration((state) => ({
+          ...state,
+          message: approved
+            ? readOnly
+              ? "Visitante aprovado em somente visualizacao"
+              : "Visitante aprovado para editar"
+            : "Visitante recusado",
+        }));
+      } catch (error) {
+        logCollaborationDebug(
+          `approval_ui_error request=${request.requestId} error=${error instanceof Error ? error.message : String(error)}`,
+        );
+        setCollaboration((state) => ({
+          ...state,
+          message:
+            error instanceof Error
+              ? error.message
+              : "Nao foi possivel responder ao pedido.",
+        }));
+      }
+    },
+    [],
+  );
+
   useEffect(() => {
     if (!isTauri()) {
       return;
@@ -2406,7 +2501,38 @@ function App() {
         return;
       }
 
+      if (payload.kind === "joinRequest" && payload.requestId) {
+        const requestId = payload.requestId;
+        setPendingCollaborationRequests((current) => {
+          if (current.some((request) => request.requestId === requestId)) {
+            return current;
+          }
+
+          return [
+            ...current,
+            {
+              requestId,
+              peerId: payload.peerId ?? "visitante",
+              message: payload.message ?? "Visitante aguardando aprovacao.",
+              defaultReadOnly: Boolean(payload.readOnly),
+              createdAt: Date.now(),
+            },
+          ];
+        });
+        setCollaboration((state) => ({
+          ...state,
+          message: payload.message ?? "Visitante aguardando aprovacao.",
+        }));
+        setIsCollaborationOpen(true);
+        return;
+      }
+
       if (payload.kind === "peerConnected" || payload.kind === "peerDisconnected") {
+        if (payload.peerId) {
+          setPendingCollaborationRequests((current) =>
+            current.filter((request) => request.peerId !== payload.peerId),
+          );
+        }
         setCollaboration((state) => ({
           ...state,
           peerCount: payload.peerCount ?? state.peerCount,
@@ -2423,6 +2549,7 @@ function App() {
         lastCollaborationFilesSignatureRef.current = "";
         localElementLocksRef.current = {};
         remoteElementLocksRef.current = {};
+        setPendingCollaborationRequests([]);
         setCollaboration({
           status: "idle",
           message: payload.message ?? "Conexao encerrada.",
@@ -2530,6 +2657,11 @@ function App() {
 
   const removeAttachmentById = useCallback(
     async (attachmentId: string) => {
+      if (collaborationStateRef.current.readOnly) {
+        setStatus("Somente visualizacao");
+        return;
+      }
+
       const attachment = attachmentsRef.current.find((item) => item.id === attachmentId);
 
       if (!attachment || attachment.displayMode === "native") {
@@ -2999,6 +3131,11 @@ function App() {
   const handleAttachmentDragStart = useCallback(
     (event: React.PointerEvent<HTMLDivElement>, attachmentId: string) => {
       if (event.button !== 0) {
+        return;
+      }
+
+      if (collaborationStateRef.current.readOnly) {
+        setStatus("Somente visualizacao");
         return;
       }
 
@@ -3791,6 +3928,10 @@ function App() {
     collaboration.status === "hosting" || collaboration.status === "connected";
   const isGuestCollaboration =
     collaboration.role === "guest" && collaboration.status === "connected";
+  const isReadOnlyCollaboration =
+    collaboration.role === "guest" &&
+    collaboration.status === "connected" &&
+    Boolean(collaboration.readOnly);
   const isCollaborationBusy =
     collaboration.status === "starting" ||
     collaboration.status === "joining" ||
@@ -4271,6 +4412,7 @@ function App() {
                 name={activeProject.title}
                 onChange={handleCanvasChange}
                 theme={getExcalidrawTheme(appTheme)}
+                viewModeEnabled={isReadOnlyCollaboration}
                 UIOptions={{
                   canvasActions: {
                     clearCanvas: true,
@@ -4495,10 +4637,84 @@ function App() {
                     <strong>
                       {collaboration.role === "host"
                         ? `${collaboration.peerCount ?? 0} visitante(s)`
-                        : "Sessao ativa"}
+                        : collaboration.readOnly
+                          ? "Somente visualizacao"
+                          : "Edicao permitida"}
                     </strong>
                   </div>
                   <span className="collaboration-live-dot" />
+                </div>
+              ) : null}
+
+              {isCollaborationActive ? (
+                <div className="collaboration-security-row">
+                  <span>
+                    <ShieldCheck size={14} />
+                    Mensagens criptografadas
+                  </span>
+                  {collaboration.role === "guest" && collaboration.readOnly ? (
+                    <span>
+                      <Eye size={14} />
+                      Somente visualizacao
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {collaboration.role === "host" && pendingCollaborationRequests.length ? (
+                <div className="collaboration-section">
+                  <label>Pedidos de entrada</label>
+                  <div className="collaboration-request-list">
+                    {pendingCollaborationRequests.map((request) => (
+                      <div className="collaboration-request" key={request.requestId}>
+                        <div>
+                          <strong>{request.peerId}</strong>
+                          <span>{request.message}</span>
+                        </div>
+                        <div className="collaboration-request-actions">
+                          <button
+                            className="toolbar-button"
+                            onClick={() => {
+                              void handleRespondCollaborationRequest(
+                                request,
+                                true,
+                                false,
+                              );
+                            }}
+                            type="button"
+                          >
+                            Editar
+                          </button>
+                          <button
+                            className="toolbar-button"
+                            onClick={() => {
+                              void handleRespondCollaborationRequest(
+                                request,
+                                true,
+                                true,
+                              );
+                            }}
+                            type="button"
+                          >
+                            Visualizar
+                          </button>
+                          <button
+                            className="toolbar-button danger-action"
+                            onClick={() => {
+                              void handleRespondCollaborationRequest(
+                                request,
+                                false,
+                                request.defaultReadOnly,
+                              );
+                            }}
+                            type="button"
+                          >
+                            Recusar
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               ) : null}
 
@@ -4553,6 +4769,28 @@ function App() {
               {!isCollaborationActive ? (
                 <>
                   <div className="collaboration-section">
+                    <div className="collaboration-options">
+                      <label className="collaboration-option">
+                        <input
+                          checked={collaborationRequireApproval}
+                          onChange={(event) =>
+                            setCollaborationRequireApproval(event.currentTarget.checked)
+                          }
+                          type="checkbox"
+                        />
+                        <span>Exigir aprovacao do host</span>
+                      </label>
+                      <label className="collaboration-option">
+                        <input
+                          checked={collaborationDefaultReadOnly}
+                          onChange={(event) =>
+                            setCollaborationDefaultReadOnly(event.currentTarget.checked)
+                          }
+                          type="checkbox"
+                        />
+                        <span>Visitantes entram somente visualizacao</span>
+                      </label>
+                    </div>
                     <button
                       className="toolbar-button"
                       disabled={!activeProject || isCollaborationBusy}

@@ -1,6 +1,11 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    XChaCha20Poly1305, XNonce,
+};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
@@ -13,13 +18,18 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, State};
 
 const INVITE_PREFIX: &str = "EXC1.";
 const COLLABORATION_EVENT: &str = "collaboration-event";
-const MAX_WIRE_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_WIRE_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ENCRYPTED_WIRE_MESSAGE_BYTES: usize = MAX_WIRE_MESSAGE_BYTES + 128;
+const MAX_COLLABORATION_PEERS: usize = 4;
+const JOIN_APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+const PEER_RATE_WINDOW: Duration = Duration::from_secs(1);
+const MAX_SCENE_UPDATES_PER_WINDOW: usize = 12;
 
 #[derive(Default)]
 pub struct CollaborationManager {
@@ -38,8 +48,10 @@ struct CollaborationRuntime {
     canvas_id: String,
     peer_id: String,
     code: Option<String>,
+    read_only: bool,
     stop: Arc<AtomicBool>,
-    peers: Option<Arc<Mutex<HashMap<String, Sender<WireMessage>>>>>,
+    peers: Option<Arc<Mutex<HashMap<String, PeerConnection>>>>,
+    pending_approvals: Option<Arc<Mutex<HashMap<String, Sender<ApprovalDecision>>>>>,
     outbound: Option<Sender<WireMessage>>,
     latest_payload: Option<Arc<Mutex<String>>>,
 }
@@ -71,6 +83,7 @@ enum WireMessage {
         canvas_id: String,
         payload: String,
         peer_count: usize,
+        read_only: bool,
     },
     SceneUpdate {
         session_id: String,
@@ -107,6 +120,7 @@ pub struct CollaborationSessionInfo {
     code: Option<String>,
     endpoints: Vec<String>,
     peer_count: usize,
+    read_only: bool,
     initial_payload: Option<String>,
 }
 
@@ -117,9 +131,43 @@ struct CollaborationEvent {
     role: Option<String>,
     session_id: Option<String>,
     canvas_id: Option<String>,
+    request_id: Option<String>,
+    peer_id: Option<String>,
+    read_only: Option<bool>,
     payload: Option<String>,
     peer_count: Option<usize>,
     message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollaborationStartOptions {
+    require_approval: bool,
+    default_read_only: bool,
+}
+
+impl Default for CollaborationStartOptions {
+    fn default() -> Self {
+        Self {
+            require_approval: true,
+            default_read_only: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CollaborationCrypto {
+    cipher: XChaCha20Poly1305,
+}
+
+struct PeerConnection {
+    tx: Sender<WireMessage>,
+}
+
+#[derive(Clone, Copy)]
+struct ApprovalDecision {
+    approved: bool,
+    read_only: bool,
 }
 
 trait CollaborationEventSink: Clone + Send + Sync + 'static {
@@ -138,8 +186,15 @@ pub fn start_collaboration_session(
     state: State<'_, CollaborationManager>,
     canvas_id: String,
     initial_payload: String,
+    options: Option<CollaborationStartOptions>,
 ) -> Result<CollaborationSessionInfo, String> {
-    start_collaboration_session_inner(app, state.inner(), canvas_id, initial_payload)
+    start_collaboration_session_inner(
+        app,
+        state.inner(),
+        canvas_id,
+        initial_payload,
+        options.unwrap_or_default(),
+    )
 }
 
 fn start_collaboration_session_inner<S: CollaborationEventSink>(
@@ -147,6 +202,7 @@ fn start_collaboration_session_inner<S: CollaborationEventSink>(
     manager: &CollaborationManager,
     canvas_id: String,
     initial_payload: String,
+    options: CollaborationStartOptions,
 ) -> Result<CollaborationSessionInfo, String> {
     let canvas_id = canvas_id.trim().to_string();
     append_debug_log(&format!(
@@ -194,7 +250,9 @@ fn start_collaboration_session_inner<S: CollaborationEventSink>(
     let code = encode_invite(&invite)?;
     let stop = Arc::new(AtomicBool::new(false));
     let peers = Arc::new(Mutex::new(HashMap::new()));
+    let pending_approvals = Arc::new(Mutex::new(HashMap::new()));
     let latest_payload = Arc::new(Mutex::new(initial_payload.clone()));
+    let crypto = collaboration_crypto(&session_id, &canvas_id, &token);
 
     {
         let mut runtime = manager.runtime.lock().map_err(|error| error.to_string())?;
@@ -204,8 +262,10 @@ fn start_collaboration_session_inner<S: CollaborationEventSink>(
             canvas_id: canvas_id.clone(),
             peer_id: peer_id.clone(),
             code: Some(code.clone()),
+            read_only: false,
             stop: Arc::clone(&stop),
             peers: Some(Arc::clone(&peers)),
+            pending_approvals: Some(Arc::clone(&pending_approvals)),
             outbound: None,
             latest_payload: Some(Arc::clone(&latest_payload)),
         });
@@ -219,8 +279,12 @@ fn start_collaboration_session_inner<S: CollaborationEventSink>(
             canvas_id: canvas_id.clone(),
             token,
             host_peer_id: peer_id.clone(),
+            crypto,
+            require_approval: options.require_approval,
+            default_read_only: options.default_read_only,
             stop,
             peers,
+            pending_approvals,
             latest_payload,
         },
     );
@@ -232,6 +296,9 @@ fn start_collaboration_session_inner<S: CollaborationEventSink>(
             role: Some("host".to_string()),
             session_id: Some(session_id.clone()),
             canvas_id: Some(canvas_id.clone()),
+            request_id: None,
+            peer_id: Some(peer_id.clone()),
+            read_only: Some(false),
             payload: None,
             peer_count: Some(0),
             message: Some("Colaboracao iniciada.".to_string()),
@@ -246,6 +313,7 @@ fn start_collaboration_session_inner<S: CollaborationEventSink>(
         code: Some(code),
         endpoints,
         peer_count: 0,
+        read_only: false,
         initial_payload: None,
     })
 }
@@ -281,6 +349,7 @@ fn join_collaboration_session_inner<S: CollaborationEventSink>(
     stop_existing_runtime(manager, "Sessao substituida.");
 
     let peer_id = random_token(8);
+    let crypto = collaboration_crypto(&invite.session_id, &invite.canvas_id, &invite.token);
     let mut last_error = "Nao foi possivel conectar ao host.".to_string();
     append_debug_log(&format!(
         "native join_decoded session={} canvas={} peer={} endpoints={}",
@@ -300,6 +369,7 @@ fn join_collaboration_session_inner<S: CollaborationEventSink>(
 
                 send_wire_message(
                     &mut stream,
+                    &crypto,
                     &WireMessage::Hello {
                         token: invite.token.clone(),
                         client_id: peer_id.clone(),
@@ -309,13 +379,14 @@ fn join_collaboration_session_inner<S: CollaborationEventSink>(
                 let mut reader =
                     BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
 
-                let welcome = match read_wire_message(&mut reader) {
+                let welcome = match read_wire_message(&mut reader, &crypto) {
                     Ok(Some(WireMessage::Welcome {
                         session_id,
                         canvas_id,
                         payload,
                         peer_count,
-                    })) => (session_id, canvas_id, payload, peer_count),
+                        read_only,
+                    })) => (session_id, canvas_id, payload, peer_count, read_only),
                     Ok(Some(WireMessage::Error { message })) => {
                         append_debug_log(&format!(
                             "native guest_welcome_error endpoint={endpoint} message={message}"
@@ -346,9 +417,9 @@ fn join_collaboration_session_inner<S: CollaborationEventSink>(
                     }
                 };
 
-                let (session_id, canvas_id, payload, peer_count) = welcome;
+                let (session_id, canvas_id, payload, peer_count, read_only) = welcome;
                 append_debug_log(&format!(
-                    "native guest_welcome_ok session={session_id} canvas={canvas_id} peers={peer_count} {}",
+                    "native guest_welcome_ok session={session_id} canvas={canvas_id} peers={peer_count} read_only={read_only} {}",
                     payload_summary(&payload)
                 ));
                 let stop = Arc::new(AtomicBool::new(false));
@@ -360,12 +431,14 @@ fn join_collaboration_session_inner<S: CollaborationEventSink>(
                 spawn_writer_thread(
                     writer_stream,
                     rx,
+                    crypto.clone(),
                     Arc::clone(&stop),
                     format!("guest session={session_id} canvas={canvas_id} peer={peer_id}"),
                 );
                 spawn_guest_reader(
                     event_sink.clone(),
                     reader_stream,
+                    crypto.clone(),
                     Arc::clone(&stop),
                     session_id.clone(),
                     canvas_id.clone(),
@@ -379,8 +452,10 @@ fn join_collaboration_session_inner<S: CollaborationEventSink>(
                         canvas_id: canvas_id.clone(),
                         peer_id: peer_id.clone(),
                         code: None,
+                        read_only,
                         stop,
                         peers: None,
+                        pending_approvals: None,
                         outbound: Some(tx),
                         latest_payload: None,
                     });
@@ -393,6 +468,9 @@ fn join_collaboration_session_inner<S: CollaborationEventSink>(
                         role: Some("guest".to_string()),
                         session_id: Some(session_id.clone()),
                         canvas_id: Some(canvas_id.clone()),
+                        request_id: None,
+                        peer_id: Some(peer_id.clone()),
+                        read_only: Some(read_only),
                         payload: None,
                         peer_count: Some(peer_count),
                         message: Some("Conectado ao host.".to_string()),
@@ -407,6 +485,7 @@ fn join_collaboration_session_inner<S: CollaborationEventSink>(
                     code: None,
                     endpoints: invite.endpoints,
                     peer_count,
+                    read_only,
                     initial_payload: Some(payload),
                 });
             }
@@ -446,6 +525,7 @@ fn send_collaboration_update_inner(
         append_debug_log("native send_rejected reason=missing_payload");
         return Err("Cena ausente para sincronizar.".to_string());
     }
+    validate_payload_size(&payload)?;
 
     let mut runtime = manager.runtime.lock().map_err(|error| error.to_string())?;
     if runtime
@@ -461,6 +541,11 @@ fn send_collaboration_update_inner(
         append_debug_log("native send_rejected reason=no_runtime");
         return Err("Nao ha colaboracao ativa.".to_string());
     };
+
+    if runtime.role == CollaborationRole::Guest && runtime.read_only {
+        append_debug_log("native send_rejected reason=guest_read_only");
+        return Err("Esta sessao esta em modo somente visualizacao.".to_string());
+    }
 
     append_debug_log(&format!(
         "native send_update role={} session={} canvas={} peer={} {}",
@@ -546,8 +631,57 @@ fn get_collaboration_status_inner(
         code: runtime.code.clone(),
         endpoints: Vec::new(),
         peer_count,
+        read_only: runtime.read_only,
         initial_payload: None,
     }))
+}
+
+#[tauri::command]
+pub fn respond_collaboration_join_request(
+    state: State<'_, CollaborationManager>,
+    request_id: String,
+    approved: bool,
+    read_only: bool,
+) -> Result<(), String> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Err("Pedido de entrada ausente.".to_string());
+    }
+
+    let runtime = state
+        .inner()
+        .runtime
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let Some(runtime) = runtime.as_ref() else {
+        return Err("Nao ha colaboracao ativa.".to_string());
+    };
+
+    if runtime.role != CollaborationRole::Host {
+        return Err("Apenas o host pode aprovar visitantes.".to_string());
+    }
+
+    let pending_approvals = runtime
+        .pending_approvals
+        .as_ref()
+        .ok_or_else(|| "Nao ha fila de aprovacao ativa.".to_string())?;
+    let sender = pending_approvals
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(request_id)
+        .ok_or_else(|| "Pedido de entrada expirado ou ja respondido.".to_string())?;
+
+    sender
+        .send(ApprovalDecision {
+            approved,
+            read_only,
+        })
+        .map_err(|_| "Pedido de entrada nao esta mais ativo.".to_string())?;
+
+    append_debug_log(&format!(
+        "native approval_response request={request_id} approved={approved} read_only={read_only}"
+    ));
+    Ok(())
 }
 
 #[tauri::command]
@@ -580,8 +714,12 @@ struct HostSession {
     canvas_id: String,
     token: String,
     host_peer_id: String,
+    crypto: CollaborationCrypto,
+    require_approval: bool,
+    default_read_only: bool,
     stop: Arc<AtomicBool>,
-    peers: Arc<Mutex<HashMap<String, Sender<WireMessage>>>>,
+    peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
+    pending_approvals: Arc<Mutex<HashMap<String, Sender<ApprovalDecision>>>>,
     latest_payload: Arc<Mutex<String>>,
 }
 
@@ -621,6 +759,9 @@ fn spawn_host_listener<S: CollaborationEventSink>(
                             role: Some("host".to_string()),
                             session_id: Some(session.session_id.clone()),
                             canvas_id: Some(session.canvas_id.clone()),
+                            request_id: None,
+                            peer_id: None,
+                            read_only: None,
                             payload: None,
                             peer_count: None,
                             message: Some(error.to_string()),
@@ -644,8 +785,12 @@ impl HostSession {
             canvas_id: self.canvas_id.clone(),
             token: self.token.clone(),
             host_peer_id: self.host_peer_id.clone(),
+            crypto: self.crypto.clone(),
+            require_approval: self.require_approval,
+            default_read_only: self.default_read_only,
             stop: Arc::clone(&self.stop),
             peers: Arc::clone(&self.peers),
+            pending_approvals: Arc::clone(&self.pending_approvals),
             latest_payload: Arc::clone(&self.latest_payload),
         }
     }
@@ -677,6 +822,7 @@ fn handle_host_peer<S: CollaborationEventSink>(
             ));
             let _ = send_wire_message(
                 &mut stream,
+                &session.crypto,
                 &WireMessage::Error {
                     message: error.to_string(),
                 },
@@ -686,7 +832,7 @@ fn handle_host_peer<S: CollaborationEventSink>(
     };
     let mut reader = BufReader::new(reader_stream);
 
-    let peer_id = match read_wire_message(&mut reader) {
+    let peer_id = match read_wire_message(&mut reader, &session.crypto) {
         Ok(Some(WireMessage::Hello { token, client_id })) if token == session.token => {
             append_debug_log(&format!(
                 "native host_handshake_ok addr={peer_addr} peer={client_id}"
@@ -699,6 +845,7 @@ fn handle_host_peer<S: CollaborationEventSink>(
             ));
             let _ = send_wire_message(
                 &mut stream,
+                &session.crypto,
                 &WireMessage::Error {
                     message: "Token de colaboracao invalido.".to_string(),
                 },
@@ -709,6 +856,7 @@ fn handle_host_peer<S: CollaborationEventSink>(
             append_debug_log(&format!("native host_handshake_invalid addr={peer_addr}"));
             let _ = send_wire_message(
                 &mut stream,
+                &session.crypto,
                 &WireMessage::Error {
                     message: "Handshake de colaboracao invalido.".to_string(),
                 },
@@ -719,13 +867,125 @@ fn handle_host_peer<S: CollaborationEventSink>(
             append_debug_log(&format!(
                 "native host_handshake_read_error addr={peer_addr} error={error}"
             ));
-            let _ = send_wire_message(&mut stream, &WireMessage::Error { message: error });
+            let _ = send_wire_message(
+                &mut stream,
+                &session.crypto,
+                &WireMessage::Error { message: error },
+            );
             return;
         }
     };
 
     stream.set_read_timeout(None).ok();
     reader.get_ref().set_read_timeout(None).ok();
+
+    let current_peer_count = session
+        .peers
+        .lock()
+        .ok()
+        .map(|peers| peers.len())
+        .unwrap_or(MAX_COLLABORATION_PEERS);
+    if current_peer_count >= MAX_COLLABORATION_PEERS {
+        append_debug_log(&format!(
+            "native host_peer_rejected peer={peer_id} reason=max_peers count={current_peer_count}"
+        ));
+        let _ = send_wire_message(
+            &mut stream,
+            &session.crypto,
+            &WireMessage::Error {
+                message: "Limite de visitantes atingido.".to_string(),
+            },
+        );
+        return;
+    }
+
+    let read_only = if session.require_approval {
+        let request_id = random_token(8);
+        let (approval_tx, approval_rx) = mpsc::channel::<ApprovalDecision>();
+
+        {
+            let mut pending = match session.pending_approvals.lock() {
+                Ok(pending) => pending,
+                Err(_) => return,
+            };
+
+            if pending.len() >= MAX_COLLABORATION_PEERS {
+                append_debug_log(&format!(
+                    "native host_peer_rejected peer={peer_id} reason=max_pending"
+                ));
+                let _ = send_wire_message(
+                    &mut stream,
+                    &session.crypto,
+                    &WireMessage::Error {
+                        message: "Ha muitos pedidos de entrada pendentes.".to_string(),
+                    },
+                );
+                return;
+            }
+
+            pending.insert(request_id.clone(), approval_tx);
+        }
+
+        append_debug_log(&format!(
+            "native host_peer_waiting_approval peer={peer_id} request={request_id} addr={peer_addr}"
+        ));
+        emit_event(
+            &event_sink,
+            CollaborationEvent {
+                kind: "joinRequest".to_string(),
+                role: Some("host".to_string()),
+                session_id: Some(session.session_id.clone()),
+                canvas_id: Some(session.canvas_id.clone()),
+                request_id: Some(request_id.clone()),
+                peer_id: Some(peer_id.clone()),
+                read_only: Some(session.default_read_only),
+                payload: None,
+                peer_count: Some(current_peer_count),
+                message: Some(format!("Visitante aguardando aprovacao: {peer_addr}")),
+            },
+        );
+
+        match approval_rx.recv_timeout(JOIN_APPROVAL_TIMEOUT) {
+            Ok(decision) if decision.approved => decision.read_only,
+            Ok(_) => {
+                append_debug_log(&format!(
+                    "native host_peer_denied peer={peer_id} request={request_id}"
+                ));
+                let _ = send_wire_message(
+                    &mut stream,
+                    &session.crypto,
+                    &WireMessage::Error {
+                        message: "Entrada recusada pelo host.".to_string(),
+                    },
+                );
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(mut pending) = session.pending_approvals.lock() {
+                    pending.remove(&request_id);
+                }
+                append_debug_log(&format!(
+                    "native host_peer_approval_timeout peer={peer_id} request={request_id}"
+                ));
+                let _ = send_wire_message(
+                    &mut stream,
+                    &session.crypto,
+                    &WireMessage::Error {
+                        message: "Tempo de aprovacao esgotado.".to_string(),
+                    },
+                );
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                append_debug_log(&format!(
+                    "native host_peer_approval_closed peer={peer_id} request={request_id}"
+                ));
+                return;
+            }
+        }
+    } else {
+        session.default_read_only
+    };
 
     let (tx, rx) = mpsc::channel::<WireMessage>();
     let payload = session
@@ -738,18 +998,23 @@ fn handle_host_peer<S: CollaborationEventSink>(
             Ok(peers) => peers,
             Err(_) => return,
         };
-        peers.insert(peer_id.clone(), tx.clone());
+        peers.insert(
+            peer_id.clone(),
+            PeerConnection { tx: tx.clone() },
+        );
         peers.len()
     };
     let welcome_payload_summary = payload_summary(&payload);
 
     if send_wire_message(
         &mut stream,
+        &session.crypto,
         &WireMessage::Welcome {
             session_id: session.session_id.clone(),
             canvas_id: session.canvas_id.clone(),
             payload: payload.clone(),
             peer_count,
+            read_only,
         },
     )
     .is_err()
@@ -761,7 +1026,7 @@ fn handle_host_peer<S: CollaborationEventSink>(
         return;
     }
     append_debug_log(&format!(
-        "native host_welcome_sent peer={peer_id} peers={peer_count} {}",
+        "native host_welcome_sent peer={peer_id} peers={peer_count} read_only={read_only} {}",
         welcome_payload_summary
     ));
 
@@ -772,6 +1037,9 @@ fn handle_host_peer<S: CollaborationEventSink>(
             role: Some("host".to_string()),
             session_id: Some(session.session_id.clone()),
             canvas_id: Some(session.canvas_id.clone()),
+            request_id: None,
+            peer_id: Some(peer_id.clone()),
+            read_only: Some(read_only),
             payload: None,
             peer_count: Some(peer_count),
             message: Some("Visitante conectado.".to_string()),
@@ -781,6 +1049,7 @@ fn handle_host_peer<S: CollaborationEventSink>(
     spawn_writer_thread(
         stream,
         rx,
+        session.crypto.clone(),
         Arc::clone(&session.stop),
         format!(
             "host session={} canvas={} peer={peer_id}",
@@ -789,13 +1058,15 @@ fn handle_host_peer<S: CollaborationEventSink>(
     );
 
     let mut disconnect_message = "Visitante desconectado.".to_string();
+    let mut update_window_start = Instant::now();
+    let mut updates_in_window = 0usize;
 
     loop {
         if session.stop.load(Ordering::Relaxed) {
             break;
         }
 
-        match read_wire_message(&mut reader) {
+        match read_wire_message(&mut reader, &session.crypto) {
             Ok(Some(WireMessage::SceneUpdate {
                 session_id,
                 canvas_id,
@@ -803,6 +1074,40 @@ fn handle_host_peer<S: CollaborationEventSink>(
                 revision,
                 payload,
             })) if session_id == session.session_id && canvas_id == session.canvas_id => {
+                if read_only {
+                    append_debug_log(&format!(
+                        "native host_scene_update_rejected peer={peer_id} reason=read_only"
+                    ));
+                    let _ = tx.send(WireMessage::Error {
+                        message: "Visitante esta em modo somente visualizacao.".to_string(),
+                    });
+                    continue;
+                }
+
+                if let Err(error) = validate_payload_size(&payload) {
+                    append_debug_log(&format!(
+                        "native host_scene_update_rejected peer={peer_id} reason=payload_size error={error}"
+                    ));
+                    let _ = tx.send(WireMessage::Error { message: error });
+                    continue;
+                }
+
+                let now = Instant::now();
+                if now.duration_since(update_window_start) > PEER_RATE_WINDOW {
+                    update_window_start = now;
+                    updates_in_window = 0;
+                }
+                updates_in_window += 1;
+                if updates_in_window > MAX_SCENE_UPDATES_PER_WINDOW {
+                    append_debug_log(&format!(
+                        "native host_scene_update_rejected peer={peer_id} reason=rate_limit count={updates_in_window}"
+                    ));
+                    let _ = tx.send(WireMessage::Error {
+                        message: "Muitas atualizacoes em pouco tempo.".to_string(),
+                    });
+                    continue;
+                }
+
                 append_debug_log(&format!(
                     "native host_scene_update_received peer={peer_id} author={author_id} rev={revision} {}",
                     payload_summary(&payload)
@@ -826,6 +1131,9 @@ fn handle_host_peer<S: CollaborationEventSink>(
                         role: Some("host".to_string()),
                         session_id: Some(session.session_id.clone()),
                         canvas_id: Some(session.canvas_id.clone()),
+                        request_id: None,
+                        peer_id: Some(peer_id.clone()),
+                        read_only: Some(false),
                         payload: Some(payload),
                         peer_count: None,
                         message: None,
@@ -867,6 +1175,9 @@ fn handle_host_peer<S: CollaborationEventSink>(
             role: Some("host".to_string()),
             session_id: Some(session.session_id),
             canvas_id: Some(session.canvas_id),
+            request_id: None,
+            peer_id: Some(peer_id),
+            read_only: None,
             payload: None,
             peer_count: Some(peer_count),
             message: Some(disconnect_message),
@@ -877,6 +1188,7 @@ fn handle_host_peer<S: CollaborationEventSink>(
 fn spawn_writer_thread(
     mut stream: TcpStream,
     rx: mpsc::Receiver<WireMessage>,
+    crypto: CollaborationCrypto,
     stop: Arc<AtomicBool>,
     label: String,
 ) {
@@ -890,7 +1202,7 @@ fn spawn_writer_thread(
                         "native writer_send {label} {}",
                         wire_message_summary(&message)
                     ));
-                    if let Err(error) = send_wire_message(&mut stream, &message) {
+                    if let Err(error) = send_wire_message(&mut stream, &crypto, &message) {
                         append_debug_log(&format!(
                             "native writer_send_error {label} error={error}"
                         ));
@@ -922,6 +1234,7 @@ fn spawn_writer_thread(
 fn spawn_guest_reader<S: CollaborationEventSink>(
     event_sink: S,
     stream: TcpStream,
+    crypto: CollaborationCrypto,
     stop: Arc<AtomicBool>,
     session_id: String,
     canvas_id: String,
@@ -940,7 +1253,7 @@ fn spawn_guest_reader<S: CollaborationEventSink>(
                 break;
             }
 
-            match read_wire_message(&mut reader) {
+            match read_wire_message(&mut reader, &crypto) {
                 Ok(Some(WireMessage::SceneUpdate {
                     session_id: incoming_session,
                     canvas_id: incoming_canvas,
@@ -958,6 +1271,9 @@ fn spawn_guest_reader<S: CollaborationEventSink>(
                             role: Some("guest".to_string()),
                             session_id: Some(session_id.clone()),
                             canvas_id: Some(canvas_id.clone()),
+                            request_id: None,
+                            peer_id: None,
+                            read_only: None,
                             payload: Some(payload),
                             peer_count: None,
                             message: None,
@@ -975,6 +1291,9 @@ fn spawn_guest_reader<S: CollaborationEventSink>(
                             role: Some("guest".to_string()),
                             session_id: Some(session_id.clone()),
                             canvas_id: Some(canvas_id.clone()),
+                            request_id: None,
+                            peer_id: None,
+                            read_only: None,
                             payload: None,
                             peer_count: Some(0),
                             message: Some(reason),
@@ -993,6 +1312,9 @@ fn spawn_guest_reader<S: CollaborationEventSink>(
                             role: Some("guest".to_string()),
                             session_id: Some(session_id.clone()),
                             canvas_id: Some(canvas_id.clone()),
+                            request_id: None,
+                            peer_id: None,
+                            read_only: None,
                             payload: None,
                             peer_count: None,
                             message: Some(message),
@@ -1018,6 +1340,9 @@ fn spawn_guest_reader<S: CollaborationEventSink>(
                             role: Some("guest".to_string()),
                             session_id: Some(session_id.clone()),
                             canvas_id: Some(canvas_id.clone()),
+                            request_id: None,
+                            peer_id: None,
+                            read_only: None,
                             payload: None,
                             peer_count: Some(0),
                             message: Some(error),
@@ -1072,7 +1397,7 @@ fn stop_existing_runtime(manager: &CollaborationManager, reason: &str) {
 }
 
 fn broadcast_to_peers(
-    peers: &Arc<Mutex<HashMap<String, Sender<WireMessage>>>>,
+    peers: &Arc<Mutex<HashMap<String, PeerConnection>>>,
     message: &WireMessage,
     except_peer_id: Option<&str>,
 ) {
@@ -1081,16 +1406,16 @@ fn broadcast_to_peers(
         Err(_) => return,
     };
 
-    for (peer_id, tx) in peers.iter() {
+    for (peer_id, peer) in peers.iter() {
         if except_peer_id.is_some_and(|except| except == peer_id) {
             continue;
         }
 
-        let _ = tx.send(message.clone());
+        let _ = peer.tx.send(message.clone());
     }
 }
 
-fn remove_peer(peers: &Arc<Mutex<HashMap<String, Sender<WireMessage>>>>, peer_id: &str) -> usize {
+fn remove_peer(peers: &Arc<Mutex<HashMap<String, PeerConnection>>>, peer_id: &str) -> usize {
     match peers.lock() {
         Ok(mut peers) => {
             peers.remove(peer_id);
@@ -1100,24 +1425,40 @@ fn remove_peer(peers: &Arc<Mutex<HashMap<String, Sender<WireMessage>>>>, peer_id
     }
 }
 
-fn send_wire_message(stream: &mut TcpStream, message: &WireMessage) -> Result<(), String> {
+fn send_wire_message(
+    stream: &mut TcpStream,
+    crypto: &CollaborationCrypto,
+    message: &WireMessage,
+) -> Result<(), String> {
     let data = serde_json::to_vec(message).map_err(|error| error.to_string())?;
-    let length = u32::try_from(data.len())
+    if data.len() > MAX_WIRE_MESSAGE_BYTES {
+        return Err("Mensagem de colaboracao muito grande.".to_string());
+    }
+
+    let encrypted = encrypt_wire_payload(crypto, &data)?;
+    let length = u32::try_from(encrypted.len())
         .map_err(|_| "Mensagem de colaboracao muito grande.".to_string())?;
 
     stream
         .write_all(&length.to_be_bytes())
         .map_err(|error| error.to_string())?;
-    stream.write_all(&data).map_err(|error| error.to_string())?;
+    stream
+        .write_all(&encrypted)
+        .map_err(|error| error.to_string())?;
     stream.flush().map_err(|error| error.to_string())
 }
 
-fn read_wire_message(reader: &mut BufReader<TcpStream>) -> Result<Option<WireMessage>, String> {
+fn read_wire_message(
+    reader: &mut BufReader<TcpStream>,
+    crypto: &CollaborationCrypto,
+) -> Result<Option<WireMessage>, String> {
     let mut header = [0u8; 4];
 
     match reader.read_exact(&mut header) {
         Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::Interrupted => return read_wire_message(reader),
+        Err(error) if error.kind() == ErrorKind::Interrupted => {
+            return read_wire_message(reader, crypto)
+        }
         Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
             return Err("Conexao encerrada.".to_string());
         }
@@ -1132,7 +1473,7 @@ fn read_wire_message(reader: &mut BufReader<TcpStream>) -> Result<Option<WireMes
         return Ok(None);
     }
 
-    if length > MAX_WIRE_MESSAGE_BYTES {
+    if length > MAX_ENCRYPTED_WIRE_MESSAGE_BYTES {
         return Err(format!(
             "Mensagem de colaboracao muito grande: {length} bytes."
         ));
@@ -1153,10 +1494,61 @@ fn read_wire_message(reader: &mut BufReader<TcpStream>) -> Result<Option<WireMes
         Err(error) => return Err(error.to_string()),
     }
 
-    serde_json::from_slice(&data).map(Some).map_err(|error| {
-        let prefix = String::from_utf8_lossy(&data[..data.len().min(32)]);
+    let decrypted = decrypt_wire_payload(crypto, &data)?;
+
+    serde_json::from_slice(&decrypted).map(Some).map_err(|error| {
+        let prefix = String::from_utf8_lossy(&decrypted[..decrypted.len().min(32)]);
         format!("{error}; prefix={prefix:?}; bytes={}", data.len())
     })
+}
+
+fn collaboration_crypto(session_id: &str, canvas_id: &str, token: &str) -> CollaborationCrypto {
+    let mut hasher = Sha256::new();
+    hasher.update(b"excalibur-collaboration-v1");
+    hasher.update(session_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(canvas_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(token.as_bytes());
+    let key = hasher.finalize();
+
+    CollaborationCrypto {
+        cipher: XChaCha20Poly1305::new((&key).into()),
+    }
+}
+
+fn encrypt_wire_payload(crypto: &CollaborationCrypto, data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut nonce = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce);
+    let encrypted = crypto
+        .cipher
+        .encrypt(XNonce::from_slice(&nonce), data)
+        .map_err(|_| "Nao foi possivel criptografar mensagem de colaboracao.".to_string())?;
+
+    let mut output = Vec::with_capacity(nonce.len() + encrypted.len());
+    output.extend_from_slice(&nonce);
+    output.extend_from_slice(&encrypted);
+    Ok(output)
+}
+
+fn decrypt_wire_payload(crypto: &CollaborationCrypto, data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() < 24 {
+        return Err("Frame de colaboracao criptografado invalido.".to_string());
+    }
+
+    let (nonce, encrypted) = data.split_at(24);
+    crypto
+        .cipher
+        .decrypt(XNonce::from_slice(nonce), encrypted)
+        .map_err(|_| "Mensagem de colaboracao nao autenticada.".to_string())
+}
+
+fn validate_payload_size(payload: &str) -> Result<(), String> {
+    if payload.len() > MAX_WIRE_MESSAGE_BYTES {
+        Err("Cena muito grande para sincronizar com seguranca.".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn merge_payload_with_previous_files(previous_payload: &str, incoming_payload: &str) -> String {
@@ -1330,8 +1722,9 @@ fn wire_message_summary(message: &WireMessage) -> String {
             canvas_id,
             payload,
             peer_count,
+            read_only,
         } => format!(
-            "welcome session={session_id} canvas={canvas_id} peers={peer_count} {}",
+            "welcome session={session_id} canvas={canvas_id} peers={peer_count} read_only={read_only} {}",
             payload_summary(payload)
         ),
         WireMessage::SceneUpdate {
@@ -1441,6 +1834,8 @@ mod tests {
         let addr = listener.local_addr().expect("listener should expose addr");
         let payload = "x".repeat(4 * 1024 * 1024);
         let expected_len = payload.len();
+        let crypto = collaboration_crypto("session", "canvas", "token");
+        let server_crypto = crypto.clone();
 
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("server should accept client");
@@ -1451,7 +1846,8 @@ mod tests {
                 BufReader::new(stream.try_clone().expect("server should clone stream"));
             let mut writer = stream;
 
-            match read_wire_message(&mut reader).expect("server should read message") {
+            match read_wire_message(&mut reader, &server_crypto).expect("server should read message")
+            {
                 Some(WireMessage::SceneUpdate {
                     session_id,
                     canvas_id,
@@ -1470,6 +1866,7 @@ mod tests {
 
             send_wire_message(
                 &mut writer,
+                &server_crypto,
                 &WireMessage::Stop {
                     reason: "done".to_string(),
                 },
@@ -1483,6 +1880,7 @@ mod tests {
             .expect("client should set timeout");
         send_wire_message(
             &mut client,
+            &crypto,
             &WireMessage::SceneUpdate {
                 session_id: "session".to_string(),
                 canvas_id: "canvas".to_string(),
@@ -1494,7 +1892,7 @@ mod tests {
         .expect("client should send large payload");
 
         let mut reader = BufReader::new(client);
-        match read_wire_message(&mut reader).expect("client should read stop") {
+        match read_wire_message(&mut reader, &crypto).expect("client should read stop") {
             Some(WireMessage::Stop { reason }) => assert_eq!(reason, "done"),
             other => panic!("unexpected wire response: {other:?}"),
         }
@@ -1561,6 +1959,10 @@ mod tests {
             &host_manager,
             "canvas-a".to_string(),
             initial_payload.to_string(),
+            CollaborationStartOptions {
+                require_approval: false,
+                default_read_only: false,
+            },
         )
         .expect("host should start collaboration");
         let mut invite = decode_invite(host_info.code.as_deref().expect("host should expose code"))
@@ -1623,6 +2025,10 @@ mod tests {
             &host_manager,
             "canvas-a".to_string(),
             "initial-scene".to_string(),
+            CollaborationStartOptions {
+                require_approval: false,
+                default_read_only: false,
+            },
         )
         .expect("host should start collaboration");
         assert_eq!(host_info.role, "host");
@@ -1694,11 +2100,17 @@ fn emit_event<S: CollaborationEventSink>(event_sink: &S, event: CollaborationEve
         .map(|payload| payload_summary(payload))
         .unwrap_or_else(|| "payload=none".to_string());
     append_debug_log(&format!(
-        "native emit_event kind={} role={} session={} canvas={} peers={} message={} {}",
+        "native emit_event kind={} role={} session={} canvas={} request={} peer={} read_only={} peers={} message={} {}",
         event.kind,
         event.role.as_deref().unwrap_or("none"),
         event.session_id.as_deref().unwrap_or("none"),
         event.canvas_id.as_deref().unwrap_or("none"),
+        event.request_id.as_deref().unwrap_or("none"),
+        event.peer_id.as_deref().unwrap_or("none"),
+        event
+            .read_only
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
         event
             .peer_count
             .map(|count| count.to_string())

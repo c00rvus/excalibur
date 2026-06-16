@@ -1336,6 +1336,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             collaboration::start_collaboration_session,
             collaboration::join_collaboration_session,
+            collaboration::respond_collaboration_join_request,
             collaboration::stop_collaboration_session,
             collaboration::send_collaboration_update,
             collaboration::get_collaboration_status,

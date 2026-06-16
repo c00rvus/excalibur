@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   CaptureUpdateAction,
   Excalidraw,
@@ -19,12 +25,14 @@ import type {
 } from "@excalidraw/excalidraw/types";
 import type { ExcalidrawElement, FileId } from "@excalidraw/excalidraw/element/types";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openPath, openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   ChevronDown,
   Clock3,
+  Copy,
   ExternalLink,
   FileImage,
   Folder,
@@ -42,6 +50,8 @@ import {
   Settings,
   Sun,
   Trash2,
+  Users,
+  WifiOff,
   X,
 } from "lucide-react";
 import "./App.css";
@@ -82,6 +92,18 @@ import {
   setStorageRoot,
   StorageSettings,
 } from "./storage";
+import {
+  CollaborationEvent,
+  CollaborationRole,
+  CollaborationSessionInfo,
+  getCollaborationDebugLogPath,
+  getCollaborationStatus,
+  joinCollaborationSession,
+  sendCollaborationUpdate,
+  startCollaborationSession,
+  stopCollaborationSession,
+  writeCollaborationDebugLog,
+} from "./collaboration";
 
 type ExportFormat = "png" | "jpeg";
 type AppTheme = "light" | "dark";
@@ -104,6 +126,21 @@ type PreviewConversionState = {
   progress: number;
 };
 
+type CollaborationUiState = {
+  status: "idle" | "starting" | "hosting" | "joining" | "connected" | "stopping" | "error";
+  role?: CollaborationRole;
+  sessionId?: string;
+  canvasId?: string;
+  peerId?: string;
+  code?: string;
+  peerCount?: number;
+  message?: string;
+};
+
+function isGuestCollaborationState(state: CollaborationUiState) {
+  return state.role === "guest" && state.status !== "idle";
+}
+
 type ProjectFolder = {
   id: string;
   title: string;
@@ -125,6 +162,8 @@ const THEME_STORAGE_KEY = "excalibur.theme";
 const LAST_LIGHT_BG_KEY = "excalibur.lastLightBg";
 const LAST_DARK_BG_KEY = "excalibur.lastDarkBg";
 const MAX_DROPPED_ATTACHMENT_BYTES = 128 * 1024 * 1024;
+const COLLABORATION_LOCKS_PAYLOAD_KEY = "excaliburCollaborationLocks";
+const COLLABORATION_ELEMENT_LOCK_MS = 2_400;
 
 type CanvasInitialData = {
   elements: readonly ExcalidrawElement[];
@@ -136,6 +175,12 @@ type SceneViewport = {
   scrollX: number;
   scrollY: number;
   zoom: number;
+};
+
+type CollaborationElementLock = {
+  peerId: string;
+  updatedAt: number;
+  expiresAt: number;
 };
 
 function isDragInsideCurrentTarget(event: React.DragEvent<HTMLElement>) {
@@ -557,14 +602,63 @@ function getCanvasPayload(
   appState: AppState,
   files: BinaryFiles,
   attachments: CanvasAttachment[],
+  options: { includeFiles?: boolean } = {},
 ) {
+  const includeFiles = options.includeFiles ?? true;
   const payload = JSON.parse(
-    serializeAsJSON(elements, getCleanAppState(appState), files, "local"),
+    serializeAsJSON(
+      elements,
+      getCleanAppState(appState),
+      includeFiles ? files : EMPTY_FILES,
+      "local",
+    ),
   );
+
+  if (!includeFiles) {
+    delete payload.files;
+  }
 
   payload[ATTACHMENTS_PAYLOAD_KEY] = attachments;
 
   return JSON.stringify(payload);
+}
+
+function getFilesSignature(files: BinaryFiles) {
+  return JSON.stringify(
+    Object.keys(files)
+      .sort()
+      .map((fileId) => {
+        const file = files[fileId as FileId];
+
+        return {
+          id: file.id,
+          mimeType: file.mimeType,
+          dataLength: file.dataURL.length,
+          created: file.created,
+        };
+      }),
+  );
+}
+
+function getPayloadFiles(payload: Record<string, unknown>) {
+  const files = payload.files;
+
+  if (!files || typeof files !== "object" || Array.isArray(files)) {
+    return null;
+  }
+
+  return files as BinaryFiles;
+}
+
+function mergeBinaryFiles(currentFiles: BinaryFiles, incomingFiles: BinaryFiles | null) {
+  if (!incomingFiles || Object.keys(incomingFiles).length === 0) {
+    return currentFiles;
+  }
+
+  return {
+    ...currentFiles,
+    ...incomingFiles,
+  };
 }
 
 function getProjectSignature(
@@ -616,6 +710,168 @@ function getStoredCanvasAttachments(payload: Record<string, unknown>) {
     payload[ATTACHMENTS_PAYLOAD_KEY] ??
       (payload.excalibur as { attachments?: unknown } | undefined)?.attachments,
   );
+}
+
+function getStoredCollaborationLocks(payload: Record<string, unknown>) {
+  const rawLocks = payload[COLLABORATION_LOCKS_PAYLOAD_KEY];
+
+  if (!rawLocks || typeof rawLocks !== "object" || Array.isArray(rawLocks)) {
+    return {};
+  }
+
+  const now = Date.now();
+  const locks: Record<string, CollaborationElementLock> = {};
+
+  Object.entries(rawLocks as Record<string, unknown>).forEach(([elementId, rawLock]) => {
+    if (!rawLock || typeof rawLock !== "object" || Array.isArray(rawLock)) {
+      return;
+    }
+
+    const lock = rawLock as Partial<CollaborationElementLock>;
+    if (
+      typeof lock.peerId !== "string" ||
+      typeof lock.updatedAt !== "number" ||
+      typeof lock.expiresAt !== "number" ||
+      lock.expiresAt <= now
+    ) {
+      return;
+    }
+
+    locks[elementId] = {
+      peerId: lock.peerId,
+      updatedAt: lock.updatedAt,
+      expiresAt: lock.expiresAt,
+    };
+  });
+
+  return locks;
+}
+
+function pruneCollaborationLocks(
+  locks: Record<string, CollaborationElementLock>,
+  now = Date.now(),
+) {
+  return Object.fromEntries(
+    Object.entries(locks).filter(([, lock]) => lock.expiresAt > now),
+  ) as Record<string, CollaborationElementLock>;
+}
+
+function addCollaborationLocksToPayload(
+  payload: string,
+  locks: Record<string, CollaborationElementLock>,
+) {
+  const activeLocks = pruneCollaborationLocks(locks);
+
+  if (!Object.keys(activeLocks).length) {
+    return payload;
+  }
+
+  try {
+    const parsed = JSON.parse(payload);
+    parsed[COLLABORATION_LOCKS_PAYLOAD_KEY] = activeLocks;
+    return JSON.stringify(parsed);
+  } catch {
+    return payload;
+  }
+}
+
+function getChangedElementIds(
+  previousElements: readonly ExcalidrawElement[],
+  nextElements: readonly ExcalidrawElement[],
+) {
+  const previousById = new Map(previousElements.map((element) => [element.id, element]));
+  const changedIds = new Set<string>();
+
+  nextElements.forEach((element) => {
+    const previous = previousById.get(element.id);
+
+    if (
+      !previous ||
+      previous.version !== element.version ||
+      previous.versionNonce !== element.versionNonce ||
+      previous.isDeleted !== element.isDeleted
+    ) {
+      changedIds.add(element.id);
+    }
+  });
+
+  previousElements.forEach((element) => {
+    if (!nextElements.some((nextElement) => nextElement.id === element.id)) {
+      changedIds.add(element.id);
+    }
+  });
+
+  return changedIds;
+}
+
+function replaceLockedElementChanges(
+  previousElements: readonly ExcalidrawElement[],
+  nextElements: readonly ExcalidrawElement[],
+  blockedIds: Set<string>,
+) {
+  if (!blockedIds.size) {
+    return nextElements;
+  }
+
+  const previousById = new Map(previousElements.map((element) => [element.id, element]));
+  const nextIds = new Set(nextElements.map((element) => element.id));
+  const merged = nextElements.map((element) =>
+    blockedIds.has(element.id) ? previousById.get(element.id) ?? element : element,
+  );
+
+  previousElements.forEach((element) => {
+    if (blockedIds.has(element.id) && !nextIds.has(element.id)) {
+      merged.push(element);
+    }
+  });
+
+  return merged;
+}
+
+function preserveLocallyLockedElements(
+  remoteElements: readonly ExcalidrawElement[],
+  currentElements: readonly ExcalidrawElement[],
+  localLocks: Record<string, CollaborationElementLock>,
+  localPeerId: string | undefined,
+  now = Date.now(),
+) {
+  if (!localPeerId) {
+    return remoteElements;
+  }
+
+  const currentById = new Map(currentElements.map((element) => [element.id, element]));
+  const remoteIds = new Set(remoteElements.map((element) => element.id));
+  const isLocallyLocked = (elementId: string) => {
+    const lock = localLocks[elementId];
+    return lock?.peerId === localPeerId && lock.expiresAt > now;
+  };
+  const merged = remoteElements.map((element) =>
+    isLocallyLocked(element.id) ? currentById.get(element.id) ?? element : element,
+  );
+
+  currentElements.forEach((element) => {
+    if (isLocallyLocked(element.id) && !remoteIds.has(element.id)) {
+      merged.push(element);
+    }
+  });
+
+  return merged;
+}
+
+function preserveLocalViewport(
+  remoteAppState: Partial<AppState>,
+  localAppState: Partial<AppState> | null | undefined,
+) {
+  if (!localAppState) {
+    return remoteAppState;
+  }
+
+  return {
+    ...remoteAppState,
+    scrollX: localAppState.scrollX,
+    scrollY: localAppState.scrollY,
+    zoom: localAppState.zoom,
+  } as Partial<AppState>;
 }
 
 const NATIVE_PREVIEW_MAX_WIDTH = 640;
@@ -768,6 +1024,60 @@ function getNativeVideoAttachmentAtPoint(
   return null;
 }
 
+function getCollaborationStateFromInfo(
+  info: CollaborationSessionInfo,
+  status: CollaborationUiState["status"],
+): CollaborationUiState {
+  return {
+    status,
+    role: info.role,
+    sessionId: info.sessionId,
+    canvasId: info.canvasId,
+    peerId: info.peerId,
+    code: info.code ?? undefined,
+    peerCount: info.peerCount,
+    message: status === "hosting" ? "Colaboracao ativa" : "Conectado ao host",
+  };
+}
+
+function createGuestCollaborationProject(canvasId: string, title?: string): ProjectMetadata {
+  return normalizeProject({
+    id: `collab-${canvasId}`,
+    title: title?.trim() || "Canvas colaborativo",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    elementsCount: 0,
+    bytes: 0,
+    version: APP_VERSION,
+    folderId: DEFAULT_FOLDER_ID,
+    folderTitle: DEFAULT_FOLDER_TITLE,
+    sortOrder: Date.now(),
+  });
+}
+
+function summarizeCollaborationPayload(payload: string | null | undefined) {
+  if (!payload) {
+    return "payload=none";
+  }
+
+  try {
+    const parsed = JSON.parse(payload);
+    const elements = Array.isArray(parsed.elements) ? parsed.elements.length : 0;
+    const files =
+      parsed.files && typeof parsed.files === "object"
+        ? Object.keys(parsed.files).length
+        : 0;
+
+    return `bytes=${payload.length} elements=${elements} files=${files}`;
+  } catch {
+    return `bytes=${payload.length} json=invalid`;
+  }
+}
+
+function logCollaborationDebug(message: string) {
+  void writeCollaborationDebugLog(message).catch(() => undefined);
+}
+
 function App() {
   const excalidrawApiRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const elementsRef = useRef<readonly ExcalidrawElement[]>([]);
@@ -777,6 +1087,8 @@ function App() {
   const canvasHostRef = useRef<HTMLDivElement | null>(null);
   const exportMenuRef = useRef<HTMLDivElement | null>(null);
   const autoSaveTimerRef = useRef<number | null>(null);
+  const collaborationUpdateTimerRef = useRef<number | null>(null);
+  const remoteApplyTimerRef = useRef<number | null>(null);
   const themeApplyTimerRef = useRef<number | null>(null);
   const activeProjectRef = useRef<ProjectMetadata | null>(null);
   const previousThemeRef = useRef<AppTheme>(getStoredTheme());
@@ -785,6 +1097,11 @@ function App() {
   const isDirtyRef = useRef(false);
   const lastKnownSignatureRef = useRef("");
   const lastSavedSignatureRef = useRef("");
+  const lastCollaborationFilesSignatureRef = useRef("");
+  const applyingRemoteSceneRef = useRef(false);
+  const collaborationStateRef = useRef<CollaborationUiState>({ status: "idle" });
+  const localElementLocksRef = useRef<Record<string, CollaborationElementLock>>({});
+  const remoteElementLocksRef = useRef<Record<string, CollaborationElementLock>>({});
 
   const [projects, setProjects] = useState<ProjectMetadata[]>([]);
   const [folders, setFolders] = useState<ProjectFolder[]>(() => getStoredFolders());
@@ -812,6 +1129,12 @@ function App() {
   const [status, setStatus] = useState("Carregando canvas");
   const [exportedPath, setExportedPath] = useState<string | null>(null);
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
+  const [isCollaborationOpen, setIsCollaborationOpen] = useState(false);
+  const [joinCode, setJoinCode] = useState("");
+  const [collaboration, setCollaboration] = useState<CollaborationUiState>({
+    status: "idle",
+  });
+  const [collaborationLogPath, setCollaborationLogPath] = useState<string | null>(null);
   const [storageSettings, setStorageSettings] =
     useState<StorageSettings | null>(null);
   const [projectPendingDelete, setProjectPendingDelete] =
@@ -966,6 +1289,10 @@ function App() {
   useEffect(() => {
     isDirtyRef.current = isDirty;
   }, [isDirty]);
+
+  useEffect(() => {
+    collaborationStateRef.current = collaboration;
+  }, [collaboration]);
 
   useEffect(() => {
     if (!isExportMenuOpen) {
@@ -1124,6 +1451,13 @@ function App() {
         return null;
       }
 
+      if (isGuestCollaborationState(collaborationStateRef.current)) {
+        isDirtyRef.current = false;
+        setIsDirty(false);
+        setStatus("Visitante nao salva localmente");
+        return null;
+      }
+
       const elements = elementsRef.current;
       const files = filesRef.current;
       const currentAttachments = attachmentsRef.current;
@@ -1164,9 +1498,119 @@ function App() {
     }, AUTO_SAVE_DELAY_MS);
   }, [clearAutoSave, persistProject]);
 
+  const clearCollaborationUpdate = useCallback(() => {
+    if (collaborationUpdateTimerRef.current) {
+      window.clearTimeout(collaborationUpdateTimerRef.current);
+      collaborationUpdateTimerRef.current = null;
+    }
+  }, []);
+
+  const getCurrentCollaborationPayload = useCallback((options?: { includeFiles?: boolean }) => {
+    const appState = appStateRef.current;
+
+    if (!appState) {
+      return null;
+    }
+
+    const payload = getCanvasPayload(
+      elementsRef.current,
+      appState,
+      filesRef.current,
+      attachmentsRef.current,
+      options,
+    );
+
+    return addCollaborationLocksToPayload(payload, localElementLocksRef.current);
+  }, []);
+
+  const sendCurrentCollaborationPayload = useCallback(async () => {
+    const current = collaborationStateRef.current;
+
+    if (
+      applyingRemoteSceneRef.current ||
+      (current.status !== "hosting" && current.status !== "connected")
+    ) {
+      logCollaborationDebug(
+        `send_skip status=${current.status} role=${current.role ?? "none"} applyingRemote=${applyingRemoteSceneRef.current}`,
+      );
+      return;
+    }
+
+    const filesSignature = getFilesSignature(filesRef.current);
+    const includeFiles = filesSignature !== lastCollaborationFilesSignatureRef.current;
+    const payload = getCurrentCollaborationPayload({
+      includeFiles,
+    });
+
+    if (!payload) {
+      logCollaborationDebug(
+        `send_skip reason=no_payload status=${current.status} role=${current.role ?? "none"}`,
+      );
+      return;
+    }
+
+    try {
+      logCollaborationDebug(
+        `send_start status=${current.status} role=${current.role ?? "none"} includeFiles=${includeFiles} ${summarizeCollaborationPayload(payload)}`,
+      );
+      await sendCollaborationUpdate(payload);
+      lastCollaborationFilesSignatureRef.current = filesSignature;
+      logCollaborationDebug(
+        `send_ok status=${current.status} role=${current.role ?? "none"}`,
+      );
+    } catch (error) {
+      console.warn("Failed to send collaboration update", error);
+      logCollaborationDebug(
+        `send_error status=${current.status} role=${current.role ?? "none"} error=${error instanceof Error ? error.message : String(error)}`,
+      );
+      setCollaboration((state) => ({
+        ...state,
+        status: state.status === "idle" ? "idle" : "error",
+        message: "Nao foi possivel sincronizar a cena.",
+      }));
+    }
+  }, [getCurrentCollaborationPayload]);
+
+  const scheduleCollaborationUpdate = useCallback(() => {
+    const current = collaborationStateRef.current;
+
+    if (current.status !== "hosting" && current.status !== "connected") {
+      return;
+    }
+
+    clearCollaborationUpdate();
+    collaborationUpdateTimerRef.current = window.setTimeout(() => {
+      collaborationUpdateTimerRef.current = null;
+      logCollaborationDebug(
+        `send_timer_fire status=${collaborationStateRef.current.status} role=${collaborationStateRef.current.role ?? "none"}`,
+      );
+      void sendCurrentCollaborationPayload();
+    }, 280);
+  }, [clearCollaborationUpdate, sendCurrentCollaborationPayload]);
+
+  const stopCollaborationForCanvasSwitch = useCallback(async () => {
+    const current = collaborationStateRef.current;
+
+    if (!current.role || current.status === "idle") {
+      return;
+    }
+
+    clearCollaborationUpdate();
+    logCollaborationDebug(
+      `stop_for_canvas_switch status=${current.status} role=${current.role ?? "none"}`,
+    );
+    await stopCollaborationSession();
+    lastCollaborationFilesSignatureRef.current = "";
+    localElementLocksRef.current = {};
+    remoteElementLocksRef.current = {};
+    setCollaboration({ status: "idle" });
+    setJoinCode("");
+  }, [clearCollaborationUpdate]);
+
   const openProject = useCallback(
     async (project: ProjectMetadata) => {
       clearAutoSave();
+      await stopCollaborationForCanvasSwitch();
       const currentProject = activeProjectRef.current;
 
       if (currentProject && currentProject.id !== project.id && isDirtyRef.current) {
@@ -1247,15 +1691,20 @@ function App() {
         setStatus("Não foi possível abrir");
       }
     },
-    [appTheme, clearAutoSave, persistProject, lastLightBg, lastDarkBg, syncSceneViewport],
+    [appTheme, clearAutoSave, persistProject, stopCollaborationForCanvasSwitch, lastLightBg, lastDarkBg, syncSceneViewport],
   );
 
   const createAndOpenProject = useCallback(
     async (folder?: ProjectFolder) => {
       clearAutoSave();
+      await stopCollaborationForCanvasSwitch();
       const currentProject = activeProjectRef.current;
 
-      if (currentProject && isDirtyRef.current) {
+      if (
+        currentProject &&
+        isDirtyRef.current &&
+        collaborationStateRef.current.role !== "guest"
+      ) {
         await persistProject(currentProject);
       }
 
@@ -1276,7 +1725,7 @@ function App() {
       setNewProjectTitle(defaultTitle);
       setIsCreateProjectModalOpen(true);
     },
-    [activeFolderId, clearAutoSave, persistProject, setNewFolderName, setIsCreateFolderOpen, setProjectTargetFolder, setNewProjectTitle, setIsCreateProjectModalOpen],
+    [activeFolderId, clearAutoSave, persistProject, stopCollaborationForCanvasSwitch, setNewFolderName, setIsCreateFolderOpen, setProjectTargetFolder, setNewProjectTitle, setIsCreateProjectModalOpen],
   );
 
   const handleConfirmCreateProject = useCallback(async () => {
@@ -1348,9 +1797,14 @@ function App() {
   const clearActiveCanvas = useCallback(
     async (nextStatus = "Nenhum canvas selecionado") => {
       clearAutoSave();
+      await stopCollaborationForCanvasSwitch();
       const currentProject = activeProjectRef.current;
 
-      if (currentProject && isDirtyRef.current) {
+      if (
+        currentProject &&
+        isDirtyRef.current &&
+        !isGuestCollaborationState(collaborationStateRef.current)
+      ) {
         await persistProject(currentProject);
       }
 
@@ -1378,7 +1832,7 @@ function App() {
       setIsDirty(false);
       setStatus(nextStatus);
     },
-    [clearAutoSave, persistProject],
+    [clearAutoSave, persistProject, stopCollaborationForCanvasSwitch],
   );
 
   useEffect(() => {
@@ -1406,12 +1860,17 @@ function App() {
     return () => {
       mounted = false;
       clearAutoSave();
+      clearCollaborationUpdate();
       if (themeApplyTimerRef.current) {
         window.clearTimeout(themeApplyTimerRef.current);
         themeApplyTimerRef.current = null;
       }
+      if (remoteApplyTimerRef.current) {
+        window.clearTimeout(remoteApplyTimerRef.current);
+        remoteApplyTimerRef.current = null;
+      }
     };
-  }, [clearAutoSave]);
+  }, [clearAutoSave, clearCollaborationUpdate]);
 
   const handleCanvasChange = useCallback(
     (
@@ -1419,10 +1878,89 @@ function App() {
       appState: AppState,
       files: BinaryFiles,
     ) => {
+      const previousElements = elementsRef.current;
       const themedAppState = {
         ...appState,
         theme: getExcalidrawTheme(appTheme),
       } as AppState;
+      const currentCollaboration = collaborationStateRef.current;
+
+      if (
+        !applyingRemoteSceneRef.current &&
+        (currentCollaboration.status === "hosting" ||
+          currentCollaboration.status === "connected") &&
+        currentCollaboration.peerId
+      ) {
+        const now = Date.now();
+        remoteElementLocksRef.current = pruneCollaborationLocks(
+          remoteElementLocksRef.current,
+          now,
+        );
+        localElementLocksRef.current = pruneCollaborationLocks(
+          localElementLocksRef.current,
+          now,
+        );
+
+        const changedIds = getChangedElementIds(previousElements, elements);
+        const blockedIds = new Set<string>();
+
+        changedIds.forEach((elementId) => {
+          const lock = remoteElementLocksRef.current[elementId];
+          if (lock && lock.peerId !== currentCollaboration.peerId && lock.expiresAt > now) {
+            blockedIds.add(elementId);
+          }
+        });
+
+        if (blockedIds.size) {
+          const api = excalidrawApiRef.current;
+          const revertedElements = replaceLockedElementChanges(
+            previousElements,
+            elements,
+            blockedIds,
+          );
+
+          applyingRemoteSceneRef.current = true;
+          if (remoteApplyTimerRef.current) {
+            window.clearTimeout(remoteApplyTimerRef.current);
+          }
+          remoteApplyTimerRef.current = window.setTimeout(() => {
+            applyingRemoteSceneRef.current = false;
+            remoteApplyTimerRef.current = null;
+          }, 180);
+
+          elementsRef.current = revertedElements;
+          appStateRef.current = themedAppState;
+          filesRef.current = files;
+          syncSceneViewport(themedAppState);
+
+          if (api) {
+            api.updateScene({
+              elements: revertedElements,
+              appState: themedAppState,
+              captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+            });
+            api.refresh();
+          }
+
+          setStatus("Elemento em uso por outro colaborador");
+          logCollaborationDebug(
+            `local_change_blocked lockedElements=${Array.from(blockedIds).join(",")} owner=${Array.from(blockedIds).map((id) => remoteElementLocksRef.current[id]?.peerId).filter(Boolean).join(",")}`,
+          );
+          return;
+        }
+
+        if (changedIds.size) {
+          const lock: CollaborationElementLock = {
+            peerId: currentCollaboration.peerId,
+            updatedAt: now,
+            expiresAt: now + COLLABORATION_ELEMENT_LOCK_MS,
+          };
+
+          changedIds.forEach((elementId) => {
+            localElementLocksRef.current[elementId] = lock;
+          });
+        }
+      }
 
       elementsRef.current = elements;
       appStateRef.current = themedAppState;
@@ -1446,6 +1984,16 @@ function App() {
         applyCanvasTheme(appTheme, undefined, { forceBackground: true });
       }
 
+      if (applyingRemoteSceneRef.current) {
+        const remoteSignature = getProjectSignature(
+          elements,
+          themedAppState,
+          attachmentsRef.current,
+        );
+        lastKnownSignatureRef.current = remoteSignature;
+        return;
+      }
+
       if (!activeProjectRef.current) {
         return;
       }
@@ -1461,9 +2009,17 @@ function App() {
       }
 
       lastKnownSignatureRef.current = signature;
+      scheduleCollaborationUpdate();
 
       if (signature === lastSavedSignatureRef.current) {
         setIsDirty(false);
+        return;
+      }
+
+      if (collaborationStateRef.current.role === "guest") {
+        isDirtyRef.current = false;
+        setIsDirty(false);
+        setStatus("Colaborando");
         return;
       }
 
@@ -1471,7 +2027,7 @@ function App() {
       setStatus("Editando");
       scheduleAutoSave();
     },
-    [appTheme, applyCanvasTheme, scheduleAutoSave, lastLightBg, lastDarkBg, syncSceneViewport],
+    [appTheme, applyCanvasTheme, scheduleAutoSave, scheduleCollaborationUpdate, lastLightBg, lastDarkBg, syncSceneViewport],
   );
 
   useEffect(() => {
@@ -1498,10 +2054,434 @@ function App() {
   }, [videoPlayerAttachment]);
 
   const handleManualSave = useCallback(async () => {
+    if (isGuestCollaborationState(collaborationStateRef.current)) {
+      setStatus("Visitante nao salva localmente");
+      return;
+    }
+
     clearAutoSave();
     setStatus("Salvando");
     await persistProject();
   }, [clearAutoSave, persistProject]);
+
+  const applyCollaborationPayload = useCallback(
+    (payload: string, role?: CollaborationRole | null, canvasId?: string | null) => {
+      try {
+        logCollaborationDebug(
+          `apply_start incomingRole=${role ?? "none"} currentRole=${collaborationStateRef.current.role ?? "none"} canvas=${canvasId ?? "none"} ${summarizeCollaborationPayload(payload)}`,
+        );
+        const parsed = JSON.parse(payload);
+        const api = excalidrawApiRef.current;
+        const localAppState = api?.getAppState() ?? appStateRef.current;
+        const incomingLocks = getStoredCollaborationLocks(parsed);
+        const localPeerId = collaborationStateRef.current.peerId;
+        const now = Date.now();
+        remoteElementLocksRef.current = {
+          ...pruneCollaborationLocks(remoteElementLocksRef.current, now),
+          ...Object.fromEntries(
+            Object.entries(incomingLocks).filter(([, lock]) => lock.peerId !== localPeerId),
+          ),
+        };
+        const restoredAttachments = getStoredCanvasAttachments(parsed);
+        const mergedPayloadFiles = mergeBinaryFiles(filesRef.current, getPayloadFiles(parsed));
+        if (Object.keys(mergedPayloadFiles).length > 0) {
+          parsed.files = mergedPayloadFiles;
+        }
+        const restored = restore(parsed, null, null, {
+          refreshDimensions: true,
+          repairBindings: true,
+        });
+        const restoredFiles = restored.files ?? mergedPayloadFiles;
+        localElementLocksRef.current = pruneCollaborationLocks(
+          localElementLocksRef.current,
+          now,
+        );
+        const restoredElements = preserveLocallyLockedElements(
+          restored.elements,
+          elementsRef.current,
+          localElementLocksRef.current,
+          localPeerId,
+          now,
+        );
+        const title =
+          (typeof restored.appState?.name === "string" && restored.appState.name.trim()) ||
+          activeProjectRef.current?.title ||
+          "Canvas colaborativo";
+        const canvasAppState = preserveLocalViewport(
+          {
+            ...restored.appState,
+            name: title,
+            theme: getExcalidrawTheme(appTheme),
+            viewBackgroundColor: getThemeAwareCanvasBackground(
+              restored.appState.viewBackgroundColor,
+              appTheme,
+              lastLightBg,
+              lastDarkBg,
+            ),
+          },
+          localAppState,
+        ) as AppState;
+        const isGuest = role === "guest" || collaborationStateRef.current.role === "guest";
+        const project =
+          isGuest && canvasId
+            ? createGuestCollaborationProject(canvasId, title)
+            : activeProjectRef.current;
+
+        applyingRemoteSceneRef.current = true;
+        if (remoteApplyTimerRef.current) {
+          window.clearTimeout(remoteApplyTimerRef.current);
+        }
+        remoteApplyTimerRef.current = window.setTimeout(() => {
+          applyingRemoteSceneRef.current = false;
+          remoteApplyTimerRef.current = null;
+        }, 500);
+
+        if (
+          project &&
+          (!activeProjectRef.current ||
+            activeProjectRef.current.id !== project.id ||
+            activeProjectRef.current.title !== project.title)
+        ) {
+          activeProjectRef.current = project;
+          setActiveProject(project);
+          setActiveFolderId(getProjectFolderId(project));
+        }
+
+        if (api) {
+          api.addFiles(Object.values(restoredFiles));
+          api.updateScene({
+            elements: restoredElements,
+            appState: canvasAppState,
+            captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+          });
+          api.refresh();
+        } else {
+          setCanvasInitialData({
+            elements: restoredElements,
+            appState: canvasAppState,
+            files: restoredFiles,
+          });
+        }
+
+        elementsRef.current = restoredElements;
+        appStateRef.current = api?.getAppState() ?? canvasAppState;
+        filesRef.current = restoredFiles;
+        lastCollaborationFilesSignatureRef.current = getFilesSignature(restoredFiles);
+        attachmentsRef.current = restoredAttachments;
+        setAttachments(restoredAttachments);
+        setSelectedAttachmentId(null);
+        syncSceneViewport(appStateRef.current);
+
+        const currentAppState = appStateRef.current ?? canvasAppState;
+        const signature = getProjectSignature(
+          restoredElements,
+          currentAppState,
+          restoredAttachments,
+        );
+        lastKnownSignatureRef.current = signature;
+
+        if (isGuest) {
+          lastSavedSignatureRef.current = signature;
+          isDirtyRef.current = false;
+          setIsDirty(false);
+          setStatus("Colaborando");
+          logCollaborationDebug(
+            `apply_ok target=guest elements=${restoredElements.length} files=${Object.keys(restoredFiles).length}`,
+          );
+        } else {
+          isDirtyRef.current = true;
+          setIsDirty(true);
+          setStatus("Atualizado por visitante");
+          scheduleAutoSave();
+          logCollaborationDebug(
+            `apply_ok target=host elements=${restoredElements.length} files=${Object.keys(restoredFiles).length}`,
+          );
+        }
+      } catch (error) {
+        console.error("Failed to apply collaboration payload", error);
+        logCollaborationDebug(
+          `apply_error incomingRole=${role ?? "none"} error=${error instanceof Error ? error.message : String(error)}`,
+        );
+        setCollaboration((state) => ({
+          ...state,
+          status: state.status === "idle" ? "idle" : "error",
+          message: "Nao foi possivel aplicar a cena recebida.",
+        }));
+      }
+    },
+    [appTheme, lastLightBg, lastDarkBg, scheduleAutoSave, syncSceneViewport],
+  );
+
+  const handleStartCollaboration = useCallback(async () => {
+    const project = activeProjectRef.current;
+    const payload = getCurrentCollaborationPayload({ includeFiles: true });
+
+    if (!project || !payload) {
+      logCollaborationDebug("start_ui_rejected reason=no_active_canvas_or_payload");
+      setCollaboration({
+        status: "error",
+        message: "Abra um canvas antes de iniciar a colaboracao.",
+      });
+      return;
+    }
+
+    setCollaboration((state) => ({
+      ...state,
+      status: "starting",
+      message: "Iniciando colaboracao",
+    }));
+
+    try {
+      logCollaborationDebug(
+        `start_ui_request canvas=${project.id} ${summarizeCollaborationPayload(payload)}`,
+      );
+      const info = await startCollaborationSession(project.id, payload);
+      lastCollaborationFilesSignatureRef.current = getFilesSignature(filesRef.current);
+      setCollaboration(getCollaborationStateFromInfo(info, "hosting"));
+      setIsCollaborationOpen(true);
+      setStatus("Colaboracao ativa");
+      logCollaborationDebug(
+        `start_ui_ok session=${info.sessionId} canvas=${info.canvasId} peer=${info.peerId} endpoints=${info.endpoints.join(",")}`,
+      );
+    } catch (error) {
+      console.error("Failed to start collaboration", error);
+      logCollaborationDebug(
+        `start_ui_error error=${error instanceof Error ? error.message : String(error)}`,
+      );
+      setCollaboration({
+        status: "error",
+        message: error instanceof Error ? error.message : "Nao foi possivel iniciar.",
+      });
+    }
+  }, [getCurrentCollaborationPayload]);
+
+  const handleJoinCollaboration = useCallback(async () => {
+    const code = joinCode.trim();
+
+    if (!code) {
+      logCollaborationDebug("join_ui_rejected reason=empty_code");
+      setCollaboration({
+        status: "error",
+        message: "Informe o codigo de colaboracao.",
+      });
+      return;
+    }
+
+    clearAutoSave();
+    if (
+      activeProjectRef.current &&
+      isDirtyRef.current &&
+      collaborationStateRef.current.role !== "guest"
+    ) {
+      await persistProject(activeProjectRef.current);
+    }
+
+    setCollaboration((state) => ({
+      ...state,
+      status: "joining",
+      message: "Conectando ao host",
+    }));
+
+    try {
+      logCollaborationDebug(`join_ui_request code_chars=${code.length}`);
+      const info = await joinCollaborationSession(code);
+      setCollaboration(getCollaborationStateFromInfo(info, "connected"));
+      setIsCollaborationOpen(true);
+      logCollaborationDebug(
+        `join_ui_ok session=${info.sessionId} canvas=${info.canvasId} peer=${info.peerId} initial=${summarizeCollaborationPayload(info.initialPayload)}`,
+      );
+
+      if (info.initialPayload) {
+        applyCollaborationPayload(info.initialPayload, "guest", info.canvasId);
+      }
+    } catch (error) {
+      console.error("Failed to join collaboration", error);
+      logCollaborationDebug(
+        `join_ui_error error=${error instanceof Error ? error.message : String(error)}`,
+      );
+      setCollaboration({
+        status: "error",
+        message: error instanceof Error ? error.message : "Nao foi possivel conectar.",
+      });
+    }
+  }, [applyCollaborationPayload, clearAutoSave, joinCode, persistProject]);
+
+  const handleStopCollaboration = useCallback(async () => {
+    const wasGuest = collaborationStateRef.current.role === "guest";
+    logCollaborationDebug(
+      `stop_ui_request status=${collaborationStateRef.current.status} role=${collaborationStateRef.current.role ?? "none"} wasGuest=${wasGuest}`,
+    );
+
+    setCollaboration((state) => ({
+      ...state,
+      status: "stopping",
+      message: "Encerrando colaboracao",
+    }));
+
+    try {
+      clearCollaborationUpdate();
+      await stopCollaborationSession();
+      logCollaborationDebug("stop_ui_native_ok");
+    } finally {
+      lastCollaborationFilesSignatureRef.current = "";
+      localElementLocksRef.current = {};
+      remoteElementLocksRef.current = {};
+      setCollaboration({ status: "idle" });
+      setJoinCode("");
+      setStatus("Colaboracao encerrada");
+
+      if (wasGuest) {
+        logCollaborationDebug("stop_ui_clear_guest_canvas");
+        await clearActiveCanvas("Colaboracao encerrada");
+      }
+    }
+  }, [clearActiveCanvas, clearCollaborationUpdate]);
+
+  const handleOpenCollaborationLog = useCallback(async () => {
+    try {
+      const path = await getCollaborationDebugLogPath();
+      if (!path) {
+        return;
+      }
+
+      setCollaborationLogPath(path);
+      logCollaborationDebug(`open_log path=${path}`);
+      try {
+        await revealItemInDir(path);
+      } catch {
+        await openPath(path);
+      }
+    } catch (error) {
+      logCollaborationDebug(
+        `open_log_error error=${error instanceof Error ? error.message : String(error)}`,
+      );
+      setCollaboration((state) => ({
+        ...state,
+        message: "Nao foi possivel abrir o log.",
+      }));
+    }
+  }, []);
+
+  const handleCopyCollaborationCode = useCallback(async () => {
+    const code = collaborationStateRef.current.code;
+
+    if (!code) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(code);
+      setCollaboration((state) => ({
+        ...state,
+        message: "Codigo copiado",
+      }));
+    } catch {
+      setCollaboration((state) => ({
+        ...state,
+        message: "Nao foi possivel copiar automaticamente.",
+      }));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+
+    let active = true;
+    let unlisten: (() => void) | null = null;
+
+    listen<CollaborationEvent>("collaboration-event", (event) => {
+      if (!active) {
+        return;
+      }
+
+      const payload = event.payload;
+      logCollaborationDebug(
+        `event_received kind=${payload.kind} role=${payload.role ?? "none"} session=${payload.sessionId ?? "none"} canvas=${payload.canvasId ?? "none"} peers=${payload.peerCount ?? "none"} message=${payload.message ?? "none"} ${summarizeCollaborationPayload(payload.payload)}`,
+      );
+
+      if (payload.kind === "sceneUpdate" && payload.payload) {
+        applyCollaborationPayload(payload.payload, payload.role, payload.canvasId);
+        return;
+      }
+
+      if (payload.kind === "peerConnected" || payload.kind === "peerDisconnected") {
+        setCollaboration((state) => ({
+          ...state,
+          peerCount: payload.peerCount ?? state.peerCount,
+          message: payload.message ?? state.message,
+        }));
+        return;
+      }
+
+      if (payload.kind === "disconnected") {
+        const wasGuest = collaborationStateRef.current.role === "guest";
+        logCollaborationDebug(
+          `event_disconnected wasGuest=${wasGuest} currentStatus=${collaborationStateRef.current.status} message=${payload.message ?? "none"}`,
+        );
+        lastCollaborationFilesSignatureRef.current = "";
+        localElementLocksRef.current = {};
+        remoteElementLocksRef.current = {};
+        setCollaboration({
+          status: "idle",
+          message: payload.message ?? "Conexao encerrada.",
+        });
+
+        if (wasGuest) {
+          logCollaborationDebug("event_disconnected_clear_guest_canvas");
+          void clearActiveCanvas("Colaboracao encerrada");
+        }
+        return;
+      }
+
+      if (payload.kind === "error") {
+        setCollaboration((state) => ({
+          ...state,
+          status: state.status === "idle" ? "idle" : "error",
+          message: payload.message ?? "Erro na colaboracao.",
+        }));
+      }
+    })
+      .then((fn) => {
+        if (active) {
+          unlisten = fn;
+        } else {
+          fn();
+        }
+      })
+      .catch(console.error);
+
+    getCollaborationStatus()
+      .then((info) => {
+        if (!active || !info) {
+          return;
+        }
+
+        setCollaboration(
+          getCollaborationStateFromInfo(
+            info,
+            info.role === "host" ? "hosting" : "connected",
+          ),
+        );
+      })
+      .catch(console.error);
+
+    return () => {
+      active = false;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [applyCollaborationPayload, clearActiveCanvas]);
+
+  useEffect(() => {
+    return () => {
+      logCollaborationDebug("app_cleanup_stop_collaboration");
+      clearCollaborationUpdate();
+      void stopCollaborationSession();
+    };
+  }, [clearCollaborationUpdate]);
 
   const getAttachmentInsertPosition = useCallback(
     (size: { width: number; height: number }) => {
@@ -1533,11 +2513,19 @@ function App() {
       }
 
       isDirtyRef.current = true;
-      setIsDirty(true);
       setStatus(nextStatus);
+      scheduleCollaborationUpdate();
+
+      if (collaborationStateRef.current.role === "guest") {
+        isDirtyRef.current = false;
+        setIsDirty(false);
+        return;
+      }
+
+      setIsDirty(true);
       scheduleAutoSave();
     },
-    [scheduleAutoSave],
+    [scheduleAutoSave, scheduleCollaborationUpdate],
   );
 
   const removeAttachmentById = useCallback(
@@ -1692,6 +2680,11 @@ function App() {
       return;
     }
 
+    if (isGuestCollaborationState(collaborationStateRef.current)) {
+      setStatus("Visitante nao anexa arquivos");
+      return;
+    }
+
     if (!isTauri()) {
       setStatus("Anexos estao disponiveis no app desktop");
       return;
@@ -1749,6 +2742,12 @@ function App() {
       const source = pendingAttachment;
 
       if (!project || !source) {
+        return;
+      }
+
+      if (isGuestCollaborationState(collaborationStateRef.current)) {
+        setPendingAttachment(null);
+        setStatus("Visitante nao anexa arquivos");
         return;
       }
 
@@ -1844,7 +2843,10 @@ function App() {
       }
 
       stopFileDragEvent(event);
-      event.dataTransfer.dropEffect = activeProjectRef.current ? "copy" : "none";
+      event.dataTransfer.dropEffect =
+        activeProjectRef.current && !isGuestCollaborationState(collaborationStateRef.current)
+          ? "copy"
+          : "none";
     },
     [],
   );
@@ -1860,6 +2862,11 @@ function App() {
       const project = activeProjectRef.current;
       if (!project) {
         setStatus("Selecione um canvas");
+        return;
+      }
+
+      if (isGuestCollaborationState(collaborationStateRef.current)) {
+        setStatus("Visitante nao anexa arquivos");
         return;
       }
 
@@ -2046,6 +3053,12 @@ function App() {
         return;
       }
 
+      if (isGuestCollaborationState(collaborationStateRef.current)) {
+        setActiveProject(project);
+        setStatus("Visitante nao renomeia canvas");
+        return;
+      }
+
       const trimmed = title.trim() || "Sem título";
       const nextProject = normalizeProject({
         ...project,
@@ -2094,6 +3107,10 @@ function App() {
       const active = activeProjectRef.current;
       const isDeletingActiveProject = active?.id === project.id;
 
+      if (isDeletingActiveProject) {
+        await stopCollaborationForCanvasSwitch();
+      }
+
       if (active && !isDeletingActiveProject && isDirtyRef.current) {
         await persistProject(active);
       }
@@ -2134,6 +3151,7 @@ function App() {
     clearAutoSave,
     persistProject,
     projectPendingDelete,
+    stopCollaborationForCanvasSwitch,
   ]);
 
   const handleCreateFolder = useCallback(() => {
@@ -2554,6 +3572,11 @@ function App() {
       const appState = appStateRef.current;
       const elements = elementsRef.current.filter((element) => !element.isDeleted);
 
+      if (isGuestCollaborationState(collaborationStateRef.current)) {
+        setStatus("Visitante nao exporta canvas");
+        return null;
+      }
+
       if (!project || !appState || !elements.length) {
         setStatus("Nada para exportar");
         return null;
@@ -2764,6 +3787,14 @@ function App() {
   const videoPlayerSource = videoPlayerAttachment
     ? getAttachmentAssetUrl(videoPlayerAttachment.path)
     : "";
+  const isCollaborationActive =
+    collaboration.status === "hosting" || collaboration.status === "connected";
+  const isGuestCollaboration =
+    collaboration.role === "guest" && collaboration.status === "connected";
+  const isCollaborationBusy =
+    collaboration.status === "starting" ||
+    collaboration.status === "joining" ||
+    collaboration.status === "stopping";
 
   return (
     <main
@@ -3060,6 +4091,7 @@ function App() {
               <input
                 aria-label="Nome do canvas"
                 className="project-title-input"
+                disabled={isGuestCollaboration}
                 maxLength={50}
                 onBlur={(event) => handleRename(event.currentTarget.value)}
                 onKeyDown={(event) => {
@@ -3093,7 +4125,7 @@ function App() {
           <div className="topbar-actions">
             <button
               className="toolbar-button"
-              disabled={!activeProject}
+              disabled={!activeProject || isGuestCollaboration}
               onClick={handleManualSave}
               type="button"
             >
@@ -3102,19 +4134,30 @@ function App() {
             </button>
             <button
               className="toolbar-button"
-              disabled={!activeProject}
+              disabled={!activeProject || isGuestCollaboration}
               onClick={handleChooseAttachment}
               type="button"
             >
               <Paperclip size={16} />
               <span>Anexar</span>
             </button>
+            <button
+              className={`toolbar-button collaboration-trigger ${
+                isCollaborationActive ? "is-live" : ""
+              }`}
+              disabled={isCollaborationBusy}
+              onClick={() => setIsCollaborationOpen(true)}
+              type="button"
+            >
+              <Users size={16} />
+              <span>{isCollaborationActive ? "Ao vivo" : "Colaborar"}</span>
+            </button>
             <div className="export-menu" ref={exportMenuRef}>
               <button
                 aria-expanded={isExportMenuOpen}
                 aria-haspopup="menu"
                 className="toolbar-button export-trigger"
-                disabled={!activeProject}
+                disabled={!activeProject || isGuestCollaboration}
                 onClick={() => setIsExportMenuOpen((current) => !current)}
                 type="button"
               >
@@ -3122,7 +4165,7 @@ function App() {
                 <span>Exportar</span>
                 <ChevronDown className="export-chevron" size={14} />
               </button>
-              {isExportMenuOpen && activeProject ? (
+              {isExportMenuOpen && activeProject && !isGuestCollaboration ? (
                 <div className="export-menu-popover" role="menu">
                   <button
                     className="export-menu-item"
@@ -3183,7 +4226,7 @@ function App() {
             </div>
             <button
               className="icon-button danger"
-              disabled={!activeProject}
+              disabled={!activeProject || isGuestCollaboration}
               onClick={() => activeProject && requestDeleteProject(activeProject)}
               title="Excluir canvas"
               type="button"
@@ -3412,6 +4455,165 @@ function App() {
                   </a>
                 </div>
               </div>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {isCollaborationOpen ? (
+        <div
+          className="confirm-backdrop"
+          onMouseDown={() => setIsCollaborationOpen(false)}
+        >
+          <section
+            aria-label="Colaboracao"
+            aria-modal="true"
+            className="confirm-panel collaboration-panel"
+            onMouseDown={(event) => event.stopPropagation()}
+            role="dialog"
+          >
+            <header className="confirm-header">
+              <strong>Colaboracao</strong>
+              <button
+                className="icon-button"
+                onClick={() => setIsCollaborationOpen(false)}
+                title="Fechar"
+                type="button"
+              >
+                <X size={17} />
+              </button>
+            </header>
+            <div className="confirm-body collaboration-body">
+              {isCollaborationActive ? (
+                <div className="collaboration-status-card">
+                  <div>
+                    <span>
+                      {collaboration.role === "host"
+                        ? "Hospedando sessao"
+                        : "Conectado como visitante"}
+                    </span>
+                    <strong>
+                      {collaboration.role === "host"
+                        ? `${collaboration.peerCount ?? 0} visitante(s)`
+                        : "Sessao ativa"}
+                    </strong>
+                  </div>
+                  <span className="collaboration-live-dot" />
+                </div>
+              ) : null}
+
+              {collaboration.role === "host" && collaboration.code ? (
+                <div className="collaboration-section">
+                  <label htmlFor="collaboration-code">Codigo</label>
+                  <textarea
+                    id="collaboration-code"
+                    readOnly
+                    value={collaboration.code}
+                  />
+                  <div className="collaboration-actions-row">
+                    <button
+                      className="toolbar-button"
+                      onClick={handleCopyCollaborationCode}
+                      type="button"
+                    >
+                      <Copy size={16} />
+                      <span>Copiar codigo</span>
+                    </button>
+                    <button
+                      className="toolbar-button danger-action"
+                      disabled={isCollaborationBusy}
+                      onClick={() => {
+                        void handleStopCollaboration();
+                      }}
+                      type="button"
+                    >
+                      <WifiOff size={16} />
+                      <span>Parar</span>
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+
+              {collaboration.role === "guest" && isCollaborationActive ? (
+                <div className="collaboration-section">
+                  <button
+                    className="toolbar-button danger-action"
+                    disabled={isCollaborationBusy}
+                    onClick={() => {
+                      void handleStopCollaboration();
+                    }}
+                    type="button"
+                  >
+                    <WifiOff size={16} />
+                    <span>Sair da colaboracao</span>
+                  </button>
+                </div>
+              ) : null}
+
+              {!isCollaborationActive ? (
+                <>
+                  <div className="collaboration-section">
+                    <button
+                      className="toolbar-button"
+                      disabled={!activeProject || isCollaborationBusy}
+                      onClick={() => {
+                        void handleStartCollaboration();
+                      }}
+                      type="button"
+                    >
+                      <Users size={16} />
+                      <span>
+                        {collaboration.status === "starting"
+                          ? "Iniciando"
+                          : "Iniciar colaboracao"}
+                      </span>
+                    </button>
+                  </div>
+                  <div className="collaboration-section">
+                    <label htmlFor="join-collaboration-code">Entrar com codigo</label>
+                    <textarea
+                      id="join-collaboration-code"
+                      onChange={(event) => setJoinCode(event.currentTarget.value)}
+                      placeholder="Cole o codigo"
+                      value={joinCode}
+                    />
+                    <button
+                      className="toolbar-button"
+                      disabled={isCollaborationBusy || !joinCode.trim()}
+                      onClick={() => {
+                        void handleJoinCollaboration();
+                      }}
+                      type="button"
+                    >
+                      <Users size={16} />
+                      <span>
+                        {collaboration.status === "joining" ? "Conectando" : "Conectar"}
+                      </span>
+                    </button>
+                  </div>
+                </>
+              ) : null}
+
+              {collaboration.message ? (
+                <p className="collaboration-message">{collaboration.message}</p>
+              ) : null}
+
+              <div className="collaboration-actions-row">
+                <button
+                  className="toolbar-button"
+                  onClick={() => {
+                    void handleOpenCollaborationLog();
+                  }}
+                  type="button"
+                >
+                  <ExternalLink size={16} />
+                  <span>Abrir log</span>
+                </button>
+              </div>
+
+              {collaborationLogPath ? (
+                <p className="collaboration-message">Log: {collaborationLogPath}</p>
+              ) : null}
             </div>
           </section>
         </div>

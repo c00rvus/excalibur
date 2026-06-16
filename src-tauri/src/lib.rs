@@ -1,3 +1,5 @@
+mod collaboration;
+
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -1286,12 +1288,14 @@ fn save_export_to_path(path: String, bytes: Vec<u8>) -> Result<ExportedFile, Str
 fn set_titlebar_color(window: tauri::Window, theme: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE};
+        use windows::Win32::Graphics::Dwm::{
+            DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+        };
 
         let hwnd = window.hwnd().map_err(|e| e.to_string())?;
 
         let is_dark = theme == "dark";
-        
+
         let dark_mode: i32 = if is_dark { 1 } else { 0 };
         unsafe {
             let _ = DwmSetWindowAttribute(
@@ -1302,11 +1306,7 @@ fn set_titlebar_color(window: tauri::Window, theme: String) -> Result<(), String
             );
         }
 
-        let color: u32 = if is_dark {
-            0x00212121
-        } else {
-            0x00eef0f0
-        };
+        let color: u32 = if is_dark { 0x00212121 } else { 0x00eef0f0 };
 
         unsafe {
             let _ = DwmSetWindowAttribute(
@@ -1323,9 +1323,24 @@ fn set_titlebar_color(window: tauri::Window, theme: String) -> Result<(), String
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(collaboration::CollaborationManager::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                window
+                    .state::<collaboration::CollaborationManager>()
+                    .stop("Colaboracao encerrada.");
+            }
+        })
         .invoke_handler(tauri::generate_handler![
+            collaboration::start_collaboration_session,
+            collaboration::join_collaboration_session,
+            collaboration::stop_collaboration_session,
+            collaboration::send_collaboration_update,
+            collaboration::get_collaboration_status,
+            collaboration::write_collaboration_debug_log,
+            collaboration::get_collaboration_debug_log_path,
             get_storage_settings,
             set_storage_root,
             reset_storage_root,

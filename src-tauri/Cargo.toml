@@ -1,6 +1,6 @@
 [package]
 name = "excalibur"
-version = "0.4.0"
+version = "0.4.1"
 description = "A lightweight Windows whiteboard built on Excalidraw"
 authors = ["wille"]
 edition = "2021"

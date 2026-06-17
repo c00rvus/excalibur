@@ -1101,6 +1101,7 @@ function App() {
   const exportMenuRef = useRef<HTMLDivElement | null>(null);
   const autoSaveTimerRef = useRef<number | null>(null);
   const collaborationUpdateTimerRef = useRef<number | null>(null);
+  const collaborationInitialApplyTimerRef = useRef<number | null>(null);
   const remoteApplyTimerRef = useRef<number | null>(null);
   const themeApplyTimerRef = useRef<number | null>(null);
   const activeProjectRef = useRef<ProjectMetadata | null>(null);
@@ -1523,6 +1524,13 @@ function App() {
     }
   }, []);
 
+  const clearInitialCollaborationApply = useCallback(() => {
+    if (collaborationInitialApplyTimerRef.current) {
+      window.clearTimeout(collaborationInitialApplyTimerRef.current);
+      collaborationInitialApplyTimerRef.current = null;
+    }
+  }, []);
+
   const getCurrentCollaborationPayload = useCallback((options?: { includeFiles?: boolean }) => {
     const appState = appStateRef.current;
 
@@ -1618,6 +1626,7 @@ function App() {
     }
 
     clearCollaborationUpdate();
+    clearInitialCollaborationApply();
     logCollaborationDebug(
       `stop_for_canvas_switch status=${current.status} role=${current.role ?? "none"}`,
     );
@@ -1628,7 +1637,7 @@ function App() {
     setPendingCollaborationRequests([]);
     setCollaboration({ status: "idle" });
     setJoinCode("");
-  }, [clearCollaborationUpdate]);
+  }, [clearCollaborationUpdate, clearInitialCollaborationApply]);
 
   const openProject = useCallback(
     async (project: ProjectMetadata) => {
@@ -1884,6 +1893,7 @@ function App() {
       mounted = false;
       clearAutoSave();
       clearCollaborationUpdate();
+      clearInitialCollaborationApply();
       if (themeApplyTimerRef.current) {
         window.clearTimeout(themeApplyTimerRef.current);
         themeApplyTimerRef.current = null;
@@ -1893,7 +1903,7 @@ function App() {
         remoteApplyTimerRef.current = null;
       }
     };
-  }, [clearAutoSave, clearCollaborationUpdate]);
+  }, [clearAutoSave, clearCollaborationUpdate, clearInitialCollaborationApply]);
 
   const handleCanvasChange = useCallback(
     (
@@ -2233,6 +2243,11 @@ function App() {
           restoredAttachments,
         );
         lastKnownSignatureRef.current = signature;
+        setCanvasInitialData({
+          elements: restoredElements,
+          appState: canvasAppState,
+          files: restoredFiles,
+        });
 
         if (isGuest) {
           lastSavedSignatureRef.current = signature;
@@ -2264,6 +2279,34 @@ function App() {
       }
     },
     [appTheme, lastLightBg, lastDarkBg, scheduleAutoSave, syncSceneViewport],
+  );
+
+  const queueInitialCollaborationApply = useCallback(
+    (payload: string, canvasId: string, sessionId: string) => {
+      clearInitialCollaborationApply();
+      collaborationInitialApplyTimerRef.current = window.setTimeout(() => {
+        collaborationInitialApplyTimerRef.current = null;
+        const current = collaborationStateRef.current;
+
+        if (
+          current.role !== "guest" ||
+          current.sessionId !== sessionId ||
+          current.canvasId !== canvasId ||
+          current.status !== "connected"
+        ) {
+          logCollaborationDebug(
+            `initial_reapply_skip status=${current.status} role=${current.role ?? "none"} session=${current.sessionId ?? "none"} canvas=${current.canvasId ?? "none"}`,
+          );
+          return;
+        }
+
+        logCollaborationDebug(
+          `initial_reapply_start session=${sessionId} canvas=${canvasId} ${summarizeCollaborationPayload(payload)}`,
+        );
+        applyCollaborationPayload(payload, "guest", canvasId);
+      }, 220);
+    },
+    [applyCollaborationPayload, clearInitialCollaborationApply],
   );
 
   const handleStartCollaboration = useCallback(async () => {
@@ -2343,7 +2386,9 @@ function App() {
     try {
       logCollaborationDebug(`join_ui_request code_chars=${code.length}`);
       const info = await joinCollaborationSession(code);
-      setCollaboration(getCollaborationStateFromInfo(info, "connected"));
+      const connectedState = getCollaborationStateFromInfo(info, "connected");
+      collaborationStateRef.current = connectedState;
+      setCollaboration(connectedState);
       setIsCollaborationOpen(true);
       logCollaborationDebug(
         `join_ui_ok session=${info.sessionId} canvas=${info.canvasId} peer=${info.peerId} initial=${summarizeCollaborationPayload(info.initialPayload)}`,
@@ -2351,6 +2396,7 @@ function App() {
 
       if (info.initialPayload) {
         applyCollaborationPayload(info.initialPayload, "guest", info.canvasId);
+        queueInitialCollaborationApply(info.initialPayload, info.canvasId, info.sessionId);
       }
     } catch (error) {
       console.error("Failed to join collaboration", error);
@@ -2362,7 +2408,13 @@ function App() {
         message: error instanceof Error ? error.message : "Nao foi possivel conectar.",
       });
     }
-  }, [applyCollaborationPayload, clearAutoSave, joinCode, persistProject]);
+  }, [
+    applyCollaborationPayload,
+    clearAutoSave,
+    joinCode,
+    persistProject,
+    queueInitialCollaborationApply,
+  ]);
 
   const handleStopCollaboration = useCallback(async () => {
     const wasGuest = collaborationStateRef.current.role === "guest";
@@ -2378,6 +2430,7 @@ function App() {
 
     try {
       clearCollaborationUpdate();
+      clearInitialCollaborationApply();
       await stopCollaborationSession();
       logCollaborationDebug("stop_ui_native_ok");
     } finally {
@@ -2394,7 +2447,7 @@ function App() {
         await clearActiveCanvas("Colaboracao encerrada");
       }
     }
-  }, [clearActiveCanvas, clearCollaborationUpdate]);
+  }, [clearActiveCanvas, clearCollaborationUpdate, clearInitialCollaborationApply]);
 
   const handleOpenCollaborationLog = useCallback(async () => {
     try {

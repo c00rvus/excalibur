@@ -11,6 +11,7 @@ export type CollaborationSessionInfo = {
   endpoints: string[];
   peerCount: number;
   readOnly: boolean;
+  allowGuestSaveCopy: boolean;
   initialPayload?: string | null;
 };
 
@@ -31,6 +32,7 @@ export type CollaborationEvent = {
   requestId?: string | null;
   peerId?: string | null;
   readOnly?: boolean | null;
+  allowGuestSaveCopy?: boolean | null;
   payload?: string | null;
   peerCount?: number | null;
   message?: string | null;
@@ -39,6 +41,7 @@ export type CollaborationEvent = {
 export type CollaborationStartOptions = {
   requireApproval: boolean;
   defaultReadOnly: boolean;
+  allowGuestSaveCopy: boolean;
 };
 
 export async function startCollaborationSession(

@@ -699,6 +699,29 @@ button {
   pointer-events: none;
 }
 
+.area-export-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 18;
+  cursor: crosshair;
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+}
+
+.area-export-selection {
+  position: absolute;
+  top: 0;
+  left: 0;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent) 36%, transparent),
+    0 0 0 9999px color-mix(in srgb, #000000 18%, transparent);
+  pointer-events: none;
+}
+
 .remote-cursor {
   position: absolute;
   top: 0;
@@ -1147,23 +1170,75 @@ button {
 }
 
 .collaboration-panel {
-  width: min(560px, calc(100vw - 32px));
+  width: min(580px, calc(100vw - 28px));
+}
+
+.collaboration-panel .confirm-header {
+  min-height: 58px;
+  padding: 10px 12px 10px 16px;
+}
+
+.collaboration-title {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.collaboration-title strong {
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 18px;
+}
+
+.collaboration-title span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .collaboration-body {
   display: grid;
-  gap: 14px;
+  gap: 12px;
+  padding: 14px;
 }
 
 .collaboration-status-card {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
   align-items: center;
   gap: 12px;
   border: 1px solid var(--control-border);
   border-radius: 8px;
-  background: var(--settings-row);
-  padding: 12px;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--accent) 14%, transparent),
+      transparent 62%
+    ),
+    var(--settings-row);
+  padding: 11px 12px;
+}
+
+.collaboration-status-icon,
+.collaboration-section-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+}
+
+.collaboration-section-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
 }
 
 .collaboration-status-card div {
@@ -1181,7 +1256,8 @@ button {
 .collaboration-status-card strong {
   overflow: hidden;
   color: var(--fg);
-  font-size: 14px;
+  font-size: 15px;
+  font-weight: 800;
   line-height: 18px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1198,7 +1274,7 @@ button {
 .collaboration-security-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 7px;
 }
 
 .collaboration-security-row span {
@@ -1206,16 +1282,60 @@ button {
   align-items: center;
   gap: 6px;
   border-radius: 6px;
-  background: var(--settings-row);
+  border: 1px solid color-mix(in srgb, var(--control-border) 72%, transparent);
+  background: var(--settings-bg);
   color: var(--muted);
   font-size: 12px;
   line-height: 16px;
-  padding: 6px 8px;
+  padding: 5px 8px;
 }
 
 .collaboration-section {
   display: grid;
-  gap: 9px;
+  gap: 10px;
+}
+
+.collaboration-start-card,
+.collaboration-join-card,
+.collaboration-code-card,
+.collaboration-requests-card {
+  border: 1px solid color-mix(in srgb, var(--control-border) 72%, transparent);
+  border-radius: 8px;
+  background: var(--settings-row);
+  padding: 12px;
+}
+
+.collaboration-section-header {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.collaboration-section-header div:last-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.collaboration-section-header strong {
+  overflow: hidden;
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 17px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collaboration-section-header span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .collaboration-section label {
@@ -1226,7 +1346,7 @@ button {
 }
 
 .collaboration-section textarea {
-  min-height: 86px;
+  min-height: 78px;
   resize: vertical;
   border: 1px solid var(--control-border);
   border-radius: 8px;
@@ -1234,6 +1354,14 @@ button {
   color: var(--fg);
   font: 12px/1.45 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
   padding: 10px;
+}
+
+.collaboration-section textarea[readonly] {
+  min-height: 96px;
+}
+
+.collaboration-code-input {
+  min-height: 72px;
 }
 
 .collaboration-section textarea:focus {
@@ -1250,22 +1378,58 @@ button {
 
 .collaboration-options {
   display: grid;
-  gap: 8px;
+  gap: 7px;
 }
 
 .collaboration-option {
-  display: flex;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
   align-items: center;
-  gap: 8px;
+  gap: 9px;
+  min-height: 34px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--settings-bg) 58%, transparent);
   color: var(--fg);
   font-size: 12.5px;
+  font-weight: 700;
   line-height: 18px;
+  padding: 7px 9px;
 }
 
 .collaboration-option input {
   width: 15px;
   height: 15px;
   accent-color: var(--accent);
+  margin: 0;
+}
+
+.collaboration-primary-action {
+  width: 100%;
+  background: var(--accent);
+  color: #ffffff;
+}
+
+.collaboration-primary-action:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 84%, #000000);
+}
+
+.collaboration-primary-action:disabled {
+  border: 1px solid color-mix(in srgb, var(--control-border) 76%, transparent);
+  background: var(--control-bg);
+  color: var(--muted);
+  opacity: 1;
+}
+
+.app-shell[data-theme="dark"] .collaboration-primary-action {
+  color: #102221;
+}
+
+.app-shell[data-theme="dark"] .collaboration-primary-action:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 82%, #ffffff);
+}
+
+.app-shell[data-theme="dark"] .collaboration-primary-action:disabled {
+  color: var(--muted);
 }
 
 .collaboration-request-list {
@@ -1276,8 +1440,9 @@ button {
 .collaboration-request {
   display: grid;
   gap: 10px;
+  border: 1px solid color-mix(in srgb, var(--control-border) 64%, transparent);
   border-radius: 8px;
-  background: var(--settings-row);
+  background: var(--settings-bg);
   padding: 10px;
 }
 
@@ -1314,6 +1479,93 @@ button {
   font-size: 12.5px;
   line-height: 18px;
   overflow-wrap: anywhere;
+}
+
+.collaboration-message-card {
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--fg);
+  padding: 8px 10px;
+}
+
+.collaboration-footer-actions {
+  justify-content: space-between;
+  padding-top: 2px;
+}
+
+.collaboration-log-button {
+  background: transparent;
+  color: var(--fg);
+  padding-inline: 0;
+}
+
+.collaboration-log-button:hover:not(:disabled) {
+  background: transparent;
+  color: var(--accent);
+}
+
+.guest-save-panel {
+  width: min(460px, calc(100vw - 28px));
+}
+
+.guest-save-body {
+  display: grid;
+  gap: 14px;
+}
+
+.guest-save-field {
+  display: grid;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 16px;
+}
+
+.guest-save-input {
+  width: 100%;
+  border: 1px solid var(--control-border);
+  border-radius: 7px;
+  background: var(--control-bg);
+  color: var(--fg);
+  padding: 8px 10px;
+}
+
+.guest-save-folder-box {
+  display: grid;
+  gap: 9px;
+  border: 1px solid color-mix(in srgb, var(--control-border) 72%, transparent);
+  border-radius: 8px;
+  background: var(--settings-row);
+  padding: 10px;
+}
+
+.guest-save-choice {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  color: var(--fg);
+  font-size: 12.5px;
+  font-weight: 700;
+  line-height: 18px;
+}
+
+.guest-save-choice input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.guest-save-select {
+  width: 100%;
+  border: 1px solid var(--control-border);
+  border-radius: 7px;
+  background: var(--control-bg);
+  color: var(--fg);
+  font: inherit;
+  padding: 8px 10px;
 }
 
 .conversion-progress-backdrop {

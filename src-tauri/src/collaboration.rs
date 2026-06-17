@@ -50,6 +50,7 @@ struct CollaborationRuntime {
     peer_id: String,
     code: Option<String>,
     read_only: bool,
+    allow_guest_save_copy: bool,
     stop: Arc<AtomicBool>,
     peers: Option<Arc<Mutex<HashMap<String, PeerConnection>>>>,
     pending_approvals: Option<Arc<Mutex<HashMap<String, Sender<ApprovalDecision>>>>>,
@@ -85,6 +86,8 @@ enum WireMessage {
         payload: String,
         peer_count: usize,
         read_only: bool,
+        #[serde(default = "default_allow_guest_save_copy")]
+        allow_guest_save_copy: bool,
     },
     SceneUpdate {
         session_id: String,
@@ -131,6 +134,7 @@ pub struct CollaborationSessionInfo {
     endpoints: Vec<String>,
     peer_count: usize,
     read_only: bool,
+    allow_guest_save_copy: bool,
     initial_payload: Option<String>,
 }
 
@@ -144,6 +148,7 @@ struct CollaborationEvent {
     request_id: Option<String>,
     peer_id: Option<String>,
     read_only: Option<bool>,
+    allow_guest_save_copy: Option<bool>,
     payload: Option<String>,
     peer_count: Option<usize>,
     message: Option<String>,
@@ -154,6 +159,8 @@ struct CollaborationEvent {
 pub struct CollaborationStartOptions {
     require_approval: bool,
     default_read_only: bool,
+    #[serde(default = "default_allow_guest_save_copy")]
+    allow_guest_save_copy: bool,
 }
 
 impl Default for CollaborationStartOptions {
@@ -161,8 +168,13 @@ impl Default for CollaborationStartOptions {
         Self {
             require_approval: true,
             default_read_only: false,
+            allow_guest_save_copy: default_allow_guest_save_copy(),
         }
     }
+}
+
+fn default_allow_guest_save_copy() -> bool {
+    true
 }
 
 #[derive(Clone)]
@@ -273,6 +285,7 @@ fn start_collaboration_session_inner<S: CollaborationEventSink>(
             peer_id: peer_id.clone(),
             code: Some(code.clone()),
             read_only: false,
+            allow_guest_save_copy: options.allow_guest_save_copy,
             stop: Arc::clone(&stop),
             peers: Some(Arc::clone(&peers)),
             pending_approvals: Some(Arc::clone(&pending_approvals)),
@@ -292,6 +305,7 @@ fn start_collaboration_session_inner<S: CollaborationEventSink>(
             crypto,
             require_approval: options.require_approval,
             default_read_only: options.default_read_only,
+            allow_guest_save_copy: options.allow_guest_save_copy,
             stop,
             peers,
             pending_approvals,
@@ -309,6 +323,7 @@ fn start_collaboration_session_inner<S: CollaborationEventSink>(
             request_id: None,
             peer_id: Some(peer_id.clone()),
             read_only: Some(false),
+            allow_guest_save_copy: Some(options.allow_guest_save_copy),
             payload: None,
             peer_count: Some(0),
             message: Some("Colaboracao iniciada.".to_string()),
@@ -324,6 +339,7 @@ fn start_collaboration_session_inner<S: CollaborationEventSink>(
         endpoints,
         peer_count: 0,
         read_only: false,
+        allow_guest_save_copy: options.allow_guest_save_copy,
         initial_payload: None,
     })
 }
@@ -396,7 +412,15 @@ fn join_collaboration_session_inner<S: CollaborationEventSink>(
                         payload,
                         peer_count,
                         read_only,
-                    })) => (session_id, canvas_id, payload, peer_count, read_only),
+                        allow_guest_save_copy,
+                    })) => (
+                        session_id,
+                        canvas_id,
+                        payload,
+                        peer_count,
+                        read_only,
+                        allow_guest_save_copy,
+                    ),
                     Ok(Some(WireMessage::Error { message })) => {
                         append_debug_log(&format!(
                             "native guest_welcome_error endpoint={endpoint} message={message}"
@@ -427,9 +451,16 @@ fn join_collaboration_session_inner<S: CollaborationEventSink>(
                     }
                 };
 
-                let (session_id, canvas_id, payload, peer_count, read_only) = welcome;
+                let (
+                    session_id,
+                    canvas_id,
+                    payload,
+                    peer_count,
+                    read_only,
+                    allow_guest_save_copy,
+                ) = welcome;
                 append_debug_log(&format!(
-                    "native guest_welcome_ok session={session_id} canvas={canvas_id} peers={peer_count} read_only={read_only} {}",
+                    "native guest_welcome_ok session={session_id} canvas={canvas_id} peers={peer_count} read_only={read_only} allow_guest_save_copy={allow_guest_save_copy} {}",
                     payload_summary(&payload)
                 ));
                 let stop = Arc::new(AtomicBool::new(false));
@@ -463,6 +494,7 @@ fn join_collaboration_session_inner<S: CollaborationEventSink>(
                         peer_id: peer_id.clone(),
                         code: None,
                         read_only,
+                        allow_guest_save_copy,
                         stop,
                         peers: None,
                         pending_approvals: None,
@@ -481,6 +513,7 @@ fn join_collaboration_session_inner<S: CollaborationEventSink>(
                         request_id: None,
                         peer_id: Some(peer_id.clone()),
                         read_only: Some(read_only),
+                        allow_guest_save_copy: Some(allow_guest_save_copy),
                         payload: None,
                         peer_count: Some(peer_count),
                         message: Some("Conectado ao host.".to_string()),
@@ -496,6 +529,7 @@ fn join_collaboration_session_inner<S: CollaborationEventSink>(
                     endpoints: invite.endpoints,
                     peer_count,
                     read_only,
+                    allow_guest_save_copy,
                     initial_payload: Some(payload),
                 });
             }
@@ -694,6 +728,7 @@ fn get_collaboration_status_inner(
         endpoints: Vec::new(),
         peer_count,
         read_only: runtime.read_only,
+        allow_guest_save_copy: runtime.allow_guest_save_copy,
         initial_payload: None,
     }))
 }
@@ -779,6 +814,7 @@ struct HostSession {
     crypto: CollaborationCrypto,
     require_approval: bool,
     default_read_only: bool,
+    allow_guest_save_copy: bool,
     stop: Arc<AtomicBool>,
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     pending_approvals: Arc<Mutex<HashMap<String, Sender<ApprovalDecision>>>>,
@@ -824,6 +860,7 @@ fn spawn_host_listener<S: CollaborationEventSink>(
                             request_id: None,
                             peer_id: None,
                             read_only: None,
+                            allow_guest_save_copy: None,
                             payload: None,
                             peer_count: None,
                             message: Some(error.to_string()),
@@ -850,6 +887,7 @@ impl HostSession {
             crypto: self.crypto.clone(),
             require_approval: self.require_approval,
             default_read_only: self.default_read_only,
+            allow_guest_save_copy: self.allow_guest_save_copy,
             stop: Arc::clone(&self.stop),
             peers: Arc::clone(&self.peers),
             pending_approvals: Arc::clone(&self.pending_approvals),
@@ -1001,6 +1039,7 @@ fn handle_host_peer<S: CollaborationEventSink>(
                 request_id: Some(request_id.clone()),
                 peer_id: Some(peer_id.clone()),
                 read_only: Some(session.default_read_only),
+                allow_guest_save_copy: Some(session.allow_guest_save_copy),
                 payload: None,
                 peer_count: Some(current_peer_count),
                 message: Some(format!("Visitante aguardando aprovacao: {peer_addr}")),
@@ -1074,6 +1113,7 @@ fn handle_host_peer<S: CollaborationEventSink>(
             payload: payload.clone(),
             peer_count,
             read_only,
+            allow_guest_save_copy: session.allow_guest_save_copy,
         },
     )
     .is_err()
@@ -1085,7 +1125,8 @@ fn handle_host_peer<S: CollaborationEventSink>(
         return;
     }
     append_debug_log(&format!(
-        "native host_welcome_sent peer={peer_id} peers={peer_count} read_only={read_only} {}",
+        "native host_welcome_sent peer={peer_id} peers={peer_count} read_only={read_only} allow_guest_save_copy={} {}",
+        session.allow_guest_save_copy,
         welcome_payload_summary
     ));
 
@@ -1099,6 +1140,7 @@ fn handle_host_peer<S: CollaborationEventSink>(
             request_id: None,
             peer_id: Some(peer_id.clone()),
             read_only: Some(read_only),
+            allow_guest_save_copy: Some(session.allow_guest_save_copy),
             payload: None,
             peer_count: Some(peer_count),
             message: Some("Visitante conectado.".to_string()),
@@ -1189,6 +1231,7 @@ fn handle_host_peer<S: CollaborationEventSink>(
                         request_id: None,
                         peer_id: Some(peer_id.clone()),
                         read_only: Some(false),
+                        allow_guest_save_copy: Some(session.allow_guest_save_copy),
                         payload: Some(payload),
                         peer_count: None,
                         message: None,
@@ -1224,6 +1267,7 @@ fn handle_host_peer<S: CollaborationEventSink>(
                         request_id: None,
                         peer_id: Some(author_id),
                         read_only: None,
+                        allow_guest_save_copy: None,
                         payload: Some(cursor_event_payload(x, y, visible, revision)),
                         peer_count: None,
                         message: None,
@@ -1268,6 +1312,7 @@ fn handle_host_peer<S: CollaborationEventSink>(
             request_id: None,
             peer_id: Some(peer_id),
             read_only: None,
+            allow_guest_save_copy: None,
             payload: None,
             peer_count: Some(peer_count),
             message: Some(disconnect_message),
@@ -1365,6 +1410,7 @@ fn spawn_guest_reader<S: CollaborationEventSink>(
                             request_id: None,
                             peer_id: None,
                             read_only: None,
+                            allow_guest_save_copy: None,
                             payload: Some(payload),
                             peer_count: None,
                             message: None,
@@ -1390,6 +1436,7 @@ fn spawn_guest_reader<S: CollaborationEventSink>(
                             request_id: None,
                             peer_id: Some(author_id),
                             read_only: None,
+                            allow_guest_save_copy: None,
                             payload: Some(cursor_event_payload(x, y, visible, revision)),
                             peer_count: None,
                             message: None,
@@ -1410,6 +1457,7 @@ fn spawn_guest_reader<S: CollaborationEventSink>(
                             request_id: None,
                             peer_id: None,
                             read_only: None,
+                            allow_guest_save_copy: None,
                             payload: None,
                             peer_count: Some(0),
                             message: Some(reason),
@@ -1431,6 +1479,7 @@ fn spawn_guest_reader<S: CollaborationEventSink>(
                             request_id: None,
                             peer_id: None,
                             read_only: None,
+                            allow_guest_save_copy: None,
                             payload: None,
                             peer_count: None,
                             message: Some(message),
@@ -1459,6 +1508,7 @@ fn spawn_guest_reader<S: CollaborationEventSink>(
                             request_id: None,
                             peer_id: None,
                             read_only: None,
+                            allow_guest_save_copy: None,
                             payload: None,
                             peer_count: Some(0),
                             message: Some(error),
@@ -1851,8 +1901,9 @@ fn wire_message_summary(message: &WireMessage) -> String {
             payload,
             peer_count,
             read_only,
+            allow_guest_save_copy,
         } => format!(
-            "welcome session={session_id} canvas={canvas_id} peers={peer_count} read_only={read_only} {}",
+            "welcome session={session_id} canvas={canvas_id} peers={peer_count} read_only={read_only} allow_guest_save_copy={allow_guest_save_copy} {}",
             payload_summary(payload)
         ),
         WireMessage::SceneUpdate {
@@ -2102,6 +2153,7 @@ mod tests {
             CollaborationStartOptions {
                 require_approval: false,
                 default_read_only: false,
+                allow_guest_save_copy: true,
             },
         )
         .expect("host should start collaboration");
@@ -2168,6 +2220,7 @@ mod tests {
             CollaborationStartOptions {
                 require_approval: false,
                 default_read_only: false,
+                allow_guest_save_copy: true,
             },
         )
         .expect("host should start collaboration");
@@ -2247,6 +2300,7 @@ mod tests {
             CollaborationStartOptions {
                 require_approval: false,
                 default_read_only: false,
+                allow_guest_save_copy: true,
             },
         )
         .expect("host should start collaboration");

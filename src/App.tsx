@@ -9,6 +9,8 @@ import {
   CaptureUpdateAction,
   Excalidraw,
   exportToBlob,
+  exportToCanvas,
+  getCommonBounds,
   getSceneVersion,
   MainMenu,
   restore,
@@ -111,6 +113,8 @@ import {
 } from "./collaboration";
 
 type ExportFormat = "png" | "jpeg";
+type ExportScope = "canvas" | "area";
+type ExportDestination = "project" | "path";
 type AppTheme = "light" | "dark";
 type PendingAttachmentSource =
   | {
@@ -131,6 +135,26 @@ type PreviewConversionState = {
   progress: number;
 };
 
+type CanvasPoint = {
+  x: number;
+  y: number;
+};
+
+type CanvasRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type AreaExportState = {
+  current: CanvasPoint | null;
+  destination: ExportDestination;
+  format: ExportFormat;
+  pointerId: number | null;
+  start: CanvasPoint | null;
+};
+
 type CollaborationUiState = {
   status: "idle" | "starting" | "hosting" | "joining" | "connected" | "stopping" | "error";
   role?: CollaborationRole;
@@ -140,6 +164,7 @@ type CollaborationUiState = {
   code?: string;
   peerCount?: number;
   readOnly?: boolean;
+  allowGuestSaveCopy?: boolean;
   message?: string;
 };
 
@@ -164,6 +189,8 @@ type ProjectFolder = {
   color?: string;
 };
 
+type GuestSaveFolderMode = "existing" | "new";
+
 const APP_VERSION = 1;
 const AUTO_SAVE_DELAY_MS = 1_200;
 const DEFAULT_FOLDER_ID = "default";
@@ -176,6 +203,8 @@ const THEME_STORAGE_KEY = "excalibur.theme";
 const LAST_LIGHT_BG_KEY = "excalibur.lastLightBg";
 const LAST_DARK_BG_KEY = "excalibur.lastDarkBg";
 const MAX_DROPPED_ATTACHMENT_BYTES = 128 * 1024 * 1024;
+const MIN_AREA_EXPORT_SIZE = 4;
+const MAX_AREA_EXPORT_PIXELS = 48_000_000;
 const COLLABORATION_SCENE_UPDATE_DELAY_MS = 60;
 const COLLABORATION_CURSOR_UPDATE_DELAY_MS = 32;
 const COLLABORATION_REMOTE_APPLY_GUARD_MS = 120;
@@ -407,6 +436,32 @@ function createProjectTitle(projects: ProjectMetadata[], folderId: string) {
   return `Canvas ${date} ${projectCount + 1}`;
 }
 
+function createRemoteCopyTitle(title: string | undefined, projects: ProjectMetadata[], folderId: string) {
+  const sourceTitle = title?.trim() || "Canvas colaborativo";
+  const baseTitle = sourceTitle.startsWith("Copia remota - ")
+    ? sourceTitle
+    : `Copia remota - ${sourceTitle}`;
+  const folderProjectTitles = new Set(
+    projects
+      .filter((project) => getProjectFolderId(project) === folderId)
+      .map((project) => project.title.trim().toLocaleLowerCase("pt-BR")),
+  );
+
+  if (!folderProjectTitles.has(baseTitle.toLocaleLowerCase("pt-BR"))) {
+    return baseTitle;
+  }
+
+  for (let index = 2; index < 1_000; index += 1) {
+    const candidate = `${baseTitle} ${index}`;
+
+    if (!folderProjectTitles.has(candidate.toLocaleLowerCase("pt-BR"))) {
+      return candidate;
+    }
+  }
+
+  return `${baseTitle} ${Date.now()}`;
+}
+
 
 
 function getCleanAppState(appState: AppState): Partial<AppState> {
@@ -622,10 +677,234 @@ function getExportMimeType(format: ExportFormat) {
   return format === "png" ? "image/png" : "image/jpeg";
 }
 
-function getExportFileName(projectTitle: string, format: ExportFormat) {
-  return `${sanitizeFilePart(projectTitle) || "excalibur"}-${new Date()
+function getExportFileName(
+  projectTitle: string,
+  format: ExportFormat,
+  scope: ExportScope = "canvas",
+) {
+  const scopeSuffix = scope === "area" ? "-selecao" : "";
+
+  return `${sanitizeFilePart(projectTitle) || "excalibur"}${scopeSuffix}-${new Date()
     .toISOString()
     .replace(/[:.]/g, "-")}.${getExportExtension(format)}`;
+}
+
+function getExportScale(appState: Partial<AppState>) {
+  const exportScale = Number(appState.exportScale || 1);
+
+  return Number.isFinite(exportScale) && exportScale > 0 ? exportScale : 1;
+}
+
+function normalizeCanvasRect(start: CanvasPoint, current: CanvasPoint): CanvasRect {
+  const x = Math.min(start.x, current.x);
+  const y = Math.min(start.y, current.y);
+
+  return {
+    x,
+    y,
+    width: Math.abs(current.x - start.x),
+    height: Math.abs(current.y - start.y),
+  };
+}
+
+function clampCanvasPoint(point: CanvasPoint, bounds: DOMRect): CanvasPoint {
+  return {
+    x: Math.max(0, Math.min(bounds.width, point.x)),
+    y: Math.max(0, Math.min(bounds.height, point.y)),
+  };
+}
+
+function createAreaBoundsElement(rect: CanvasRect) {
+  const now = Date.now();
+
+  return {
+    id: `excalibur-area-export-${crypto.randomUUID()}`,
+    type: "rectangle",
+    x: rect.x,
+    y: rect.y,
+    width: Math.max(1, rect.width),
+    height: Math.max(1, rect.height),
+    angle: 0,
+    strokeColor: "#000000",
+    backgroundColor: "transparent",
+    fillStyle: "solid",
+    strokeWidth: 1,
+    strokeStyle: "solid",
+    roughness: 0,
+    opacity: 0,
+    groupIds: [],
+    frameId: null,
+    index: null,
+    roundness: null,
+    seed: randomElementInteger(),
+    version: 1,
+    versionNonce: randomElementInteger(),
+    isDeleted: false,
+    boundElements: null,
+    updated: now,
+    link: null,
+    locked: true,
+  } as ExcalidrawElement;
+}
+
+function elementIntersectsCanvasRect(element: ExcalidrawElement, rect: CanvasRect) {
+  const [x1, y1, x2, y2] = getCommonBounds([element]);
+
+  return (
+    x2 >= rect.x &&
+    x1 <= rect.x + rect.width &&
+    y2 >= rect.y &&
+    y1 <= rect.y + rect.height
+  );
+}
+
+function canvasToTypedBlob(
+  canvas: HTMLCanvasElement,
+  mimeType: string,
+  quality?: number,
+) {
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          reject(new Error("couldn't export area to blob"));
+          return;
+        }
+
+        resolve(blob);
+      },
+      mimeType,
+      quality,
+    );
+  });
+}
+
+async function cropCanvasToBlob({
+  backgroundColor,
+  crop,
+  format,
+  sourceCanvas,
+}: {
+  backgroundColor: string;
+  crop: CanvasRect;
+  format: ExportFormat;
+  sourceCanvas: HTMLCanvasElement;
+}) {
+  const outputCanvas = document.createElement("canvas");
+  const outputContext = outputCanvas.getContext("2d");
+
+  if (!outputContext) {
+    throw new Error("couldn't create export area context");
+  }
+
+  outputCanvas.width = Math.max(1, Math.round(crop.width));
+  outputCanvas.height = Math.max(1, Math.round(crop.height));
+  outputContext.fillStyle = backgroundColor;
+  outputContext.fillRect(0, 0, outputCanvas.width, outputCanvas.height);
+
+  const roundedCropX = Math.round(crop.x);
+  const roundedCropY = Math.round(crop.y);
+  const sourceX = Math.max(0, roundedCropX);
+  const sourceY = Math.max(0, roundedCropY);
+  const targetX = Math.max(0, sourceX - roundedCropX);
+  const targetY = Math.max(0, sourceY - roundedCropY);
+  const sourceWidth = Math.max(
+    0,
+    Math.min(sourceCanvas.width - sourceX, outputCanvas.width - targetX),
+  );
+  const sourceHeight = Math.max(
+    0,
+    Math.min(sourceCanvas.height - sourceY, outputCanvas.height - targetY),
+  );
+
+  if (sourceWidth > 0 && sourceHeight > 0) {
+    outputContext.drawImage(
+      sourceCanvas,
+      sourceX,
+      sourceY,
+      sourceWidth,
+      sourceHeight,
+      targetX,
+      targetY,
+      sourceWidth,
+      sourceHeight,
+    );
+  }
+
+  try {
+    return await canvasToTypedBlob(
+      outputCanvas,
+      getExportMimeType(format),
+      format === "jpeg" ? 0.94 : undefined,
+    );
+  } finally {
+    outputCanvas.width = 1;
+    outputCanvas.height = 1;
+  }
+}
+
+async function exportAreaToBlob({
+  appState,
+  backgroundColor,
+  elements,
+  files,
+  format,
+  rect,
+}: {
+  appState: AppState;
+  backgroundColor: string;
+  elements: readonly ExcalidrawElement[];
+  files: BinaryFiles;
+  format: ExportFormat;
+  rect: CanvasRect;
+}) {
+  const exportScale = getExportScale(appState);
+  const targetWidth = Math.max(1, Math.round(rect.width * exportScale));
+  const targetHeight = Math.max(1, Math.round(rect.height * exportScale));
+
+  if (targetWidth * targetHeight > MAX_AREA_EXPORT_PIXELS) {
+    throw new Error("AREA_EXPORT_TOO_LARGE");
+  }
+
+  const areaBoundsElement = createAreaBoundsElement(rect);
+  const renderElements = [
+    ...elements.filter((element) => elementIntersectsCanvasRect(element, rect)),
+    areaBoundsElement,
+  ];
+  const [minX, minY] = getCommonBounds(renderElements);
+  const sourceCanvas = await exportToCanvas({
+    elements: renderElements,
+    appState: {
+      ...getCleanAppState(appState),
+      exportBackground: true,
+      exportScale,
+      viewBackgroundColor: backgroundColor,
+    },
+    files,
+    exportPadding: 0,
+    getDimensions: (width: number, height: number) => ({
+      width: Math.max(1, Math.ceil(width * exportScale)),
+      height: Math.max(1, Math.ceil(height * exportScale)),
+      scale: exportScale,
+    }),
+  });
+
+  try {
+    return await cropCanvasToBlob({
+      backgroundColor,
+      crop: {
+        x: (rect.x - minX) * exportScale,
+        y: (rect.y - minY) * exportScale,
+        width: targetWidth,
+        height: targetHeight,
+      },
+      format,
+      sourceCanvas,
+    });
+  } finally {
+    sourceCanvas.width = 1;
+    sourceCanvas.height = 1;
+  }
 }
 
 function withExportPathExtension(path: string, format: ExportFormat) {
@@ -1062,6 +1341,7 @@ function getCollaborationStateFromInfo(
     code: info.code ?? undefined,
     peerCount: info.peerCount,
     readOnly: info.readOnly,
+    allowGuestSaveCopy: info.allowGuestSaveCopy,
     message: status === "hosting" ? "Colaboracao ativa" : "Conectado ao host",
   };
 }
@@ -1164,6 +1444,7 @@ function App() {
   const [status, setStatus] = useState("Carregando canvas");
   const [exportedPath, setExportedPath] = useState<string | null>(null);
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
+  const [areaExport, setAreaExport] = useState<AreaExportState | null>(null);
   const [isCollaborationOpen, setIsCollaborationOpen] = useState(false);
   const [joinCode, setJoinCode] = useState("");
   const [collaboration, setCollaboration] = useState<CollaborationUiState>({
@@ -1171,6 +1452,7 @@ function App() {
   });
   const [collaborationRequireApproval, setCollaborationRequireApproval] = useState(true);
   const [collaborationDefaultReadOnly, setCollaborationDefaultReadOnly] = useState(false);
+  const [collaborationAllowGuestSaveCopy, setCollaborationAllowGuestSaveCopy] = useState(true);
   const [pendingCollaborationRequests, setPendingCollaborationRequests] = useState<
     PendingCollaborationRequest[]
   >([]);
@@ -1194,6 +1476,13 @@ function App() {
   const [isCreateFolderOpen, setIsCreateFolderOpen] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
   const createProjectAfterFolderRef = useRef(false);
+  const [isGuestSaveDialogOpen, setIsGuestSaveDialogOpen] = useState(false);
+  const [guestSaveFolderMode, setGuestSaveFolderMode] =
+    useState<GuestSaveFolderMode>("existing");
+  const [guestSaveFolderId, setGuestSaveFolderId] = useState("");
+  const [guestSaveFolderName, setGuestSaveFolderName] = useState("");
+  const [guestSaveProjectTitle, setGuestSaveProjectTitle] = useState("");
+  const [isSavingGuestCopy, setIsSavingGuestCopy] = useState(false);
   const [pendingAttachment, setPendingAttachment] =
     useState<PendingAttachmentSource | null>(null);
   const [previewConversion, setPreviewConversion] =
@@ -1485,6 +1774,23 @@ function App() {
     [activeFolderId, folders, projectFolders],
   );
 
+  const guestSaveAvailableFolders = useMemo(() => {
+    const folderMap = new Map<string, ProjectFolder>();
+
+    for (const folder of [...folders, ...projectFolders]) {
+      const normalized = normalizeFolder(folder);
+
+      if (normalized.id) {
+        folderMap.set(normalized.id, {
+          ...normalized,
+          projects: [],
+        });
+      }
+    }
+
+    return sortFolders(Array.from(folderMap.values()));
+  }, [folders, projectFolders]);
+
   const persistProject = useCallback(
     async (project = activeProjectRef.current) => {
       const appState = appStateRef.current;
@@ -1539,6 +1845,138 @@ function App() {
       persistProject().catch(() => setStatus("Erro ao salvar"));
     }, AUTO_SAVE_DELAY_MS);
   }, [clearAutoSave, persistProject]);
+
+  const openGuestSaveDialog = useCallback(() => {
+    const project = activeProjectRef.current;
+    const currentCollaboration = collaborationStateRef.current;
+
+    if (!project || currentCollaboration.role !== "guest") {
+      return;
+    }
+
+    if (!currentCollaboration.allowGuestSaveCopy) {
+      setStatus("Host nao permite salvar copia");
+      return;
+    }
+
+    const folders = guestSaveAvailableFolders;
+    const selectedFolder =
+      folders.find((folder) => folder.id === activeFolderId) ?? folders[0] ?? null;
+
+    setGuestSaveFolderMode(selectedFolder ? "existing" : "new");
+    setGuestSaveFolderId(selectedFolder?.id ?? "");
+    setGuestSaveFolderName("");
+    setGuestSaveProjectTitle(
+      createRemoteCopyTitle(project.title, projectsRef.current, selectedFolder?.id ?? ""),
+    );
+    setIsGuestSaveDialogOpen(true);
+  }, [activeFolderId, guestSaveAvailableFolders]);
+
+  const closeGuestSaveDialog = useCallback(() => {
+    if (isSavingGuestCopy) {
+      return;
+    }
+
+    setIsGuestSaveDialogOpen(false);
+  }, [isSavingGuestCopy]);
+
+  const handleSaveGuestCopy = useCallback(async () => {
+    const currentCollaboration = collaborationStateRef.current;
+    const sourceProject = activeProjectRef.current;
+    const appState = appStateRef.current;
+
+    if (
+      !sourceProject ||
+      !appState ||
+      currentCollaboration.role !== "guest" ||
+      !currentCollaboration.allowGuestSaveCopy
+    ) {
+      setStatus("Host nao permite salvar copia");
+      return;
+    }
+
+    const now = Date.now();
+    let targetFolder: ProjectFolder | null = null;
+
+    if (guestSaveFolderMode === "new") {
+      const title = guestSaveFolderName.trim();
+
+      if (!title) {
+        setStatus("Informe o nome da pasta");
+        return;
+      }
+
+      targetFolder = normalizeFolder({
+        id: crypto.randomUUID(),
+        title,
+        projects: [],
+        createdAt: now,
+        sortOrder: now,
+      });
+    } else {
+      targetFolder =
+        guestSaveAvailableFolders.find((folder) => folder.id === guestSaveFolderId) ??
+        null;
+
+      if (!targetFolder) {
+        setStatus("Escolha uma pasta");
+        return;
+      }
+    }
+
+    const title = guestSaveProjectTitle.trim();
+    const projectTitle =
+      title || createRemoteCopyTitle(sourceProject.title, projectsRef.current, targetFolder.id);
+    const finalProjectTitle = createRemoteCopyTitle(
+      projectTitle,
+      projectsRef.current,
+      targetFolder.id,
+    );
+    const elements = elementsRef.current;
+    const files = filesRef.current;
+    const currentAttachments = attachmentsRef.current;
+    const payloadAppState = {
+      ...appState,
+      name: finalProjectTitle,
+    } as AppState;
+    const data = getCanvasPayload(elements, payloadAppState, files, currentAttachments);
+    const metadata = normalizeProject({
+      id: crypto.randomUUID(),
+      title: finalProjectTitle,
+      createdAt: now,
+      updatedAt: now,
+      elementsCount: elements.filter((element) => !element.isDeleted).length,
+      bytes: new Blob([data]).size,
+      version: APP_VERSION,
+      folderId: targetFolder.id,
+      folderTitle: targetFolder.title,
+      sortOrder: now,
+    });
+
+    setIsSavingGuestCopy(true);
+    setStatus("Salvando copia");
+
+    try {
+      const saved = normalizeProject(await saveProject(metadata, data));
+
+      setFolders((current) => mergeFolders(current, [targetFolder]));
+      setProjects((current) => upsertProject(current, saved));
+      setActiveFolderId(getProjectFolderId(saved));
+      setIsGuestSaveDialogOpen(false);
+      setStatus("Copia salva nesta maquina");
+    } catch (error) {
+      console.error("Failed to save guest collaboration copy", error);
+      setStatus("Erro ao salvar copia");
+    } finally {
+      setIsSavingGuestCopy(false);
+    }
+  }, [
+    guestSaveAvailableFolders,
+    guestSaveFolderId,
+    guestSaveFolderMode,
+    guestSaveFolderName,
+    guestSaveProjectTitle,
+  ]);
 
   const clearCollaborationUpdate = useCallback(() => {
     if (collaborationUpdateTimerRef.current) {
@@ -2134,14 +2572,14 @@ function App() {
 
   const handleManualSave = useCallback(async () => {
     if (isGuestCollaborationState(collaborationStateRef.current)) {
-      setStatus("Visitante nao salva localmente");
+      openGuestSaveDialog();
       return;
     }
 
     clearAutoSave();
     setStatus("Salvando");
     await persistProject();
-  }, [clearAutoSave, persistProject]);
+  }, [clearAutoSave, openGuestSaveDialog, persistProject]);
 
   const applyCollaborationPayload = useCallback(
     (payload: string, role?: CollaborationRole | null, canvasId?: string | null) => {
@@ -2322,6 +2760,7 @@ function App() {
       const info = await startCollaborationSession(project.id, payload, {
         requireApproval: collaborationRequireApproval,
         defaultReadOnly: collaborationDefaultReadOnly,
+        allowGuestSaveCopy: collaborationAllowGuestSaveCopy,
       });
       lastCollaborationFilesSignatureRef.current = getFilesSignature(filesRef.current);
       setPendingCollaborationRequests([]);
@@ -2341,7 +2780,12 @@ function App() {
         message: error instanceof Error ? error.message : "Nao foi possivel iniciar.",
       });
     }
-  }, [collaborationDefaultReadOnly, collaborationRequireApproval, getCurrentCollaborationPayload]);
+  }, [
+    collaborationAllowGuestSaveCopy,
+    collaborationDefaultReadOnly,
+    collaborationRequireApproval,
+    getCurrentCollaborationPayload,
+  ]);
 
   const handleJoinCollaboration = useCallback(async () => {
     const code = joinCode.trim();
@@ -3874,44 +4318,71 @@ function App() {
   }, []);
 
   const buildExportPayload = useCallback(
-    async (format: ExportFormat) => {
+    async (
+      format: ExportFormat,
+      scope: ExportScope = "canvas",
+      areaRect?: CanvasRect,
+    ) => {
       const project = activeProjectRef.current;
-      const appState = appStateRef.current;
-      const elements = elementsRef.current.filter((element) => !element.isDeleted);
+      const api = excalidrawApiRef.current;
+      const appState = api?.getAppState() ?? appStateRef.current;
+      const elements = (api?.getSceneElements() ?? elementsRef.current).filter(
+        (element) => !element.isDeleted,
+      );
 
       if (isGuestCollaborationState(collaborationStateRef.current)) {
         setStatus("Visitante nao exporta canvas");
         return null;
       }
 
-      if (!project || !appState || !elements.length) {
+      if (!project || !appState || (scope === "canvas" && !elements.length)) {
         setStatus("Nada para exportar");
+        return null;
+      }
+
+      if (scope === "area" && !areaRect) {
+        setStatus("Nenhuma area para exportar");
         return null;
       }
 
       clearAutoSave();
       await persistProject(project);
-      setStatus(`Exportando ${getExportLabel(format)}`);
+      setStatus(
+        scope === "area"
+          ? `Exportando selecao ${getExportLabel(format)}`
+          : `Exportando ${getExportLabel(format)}`,
+      );
 
-      const blob = await exportToBlob({
-        elements,
-        appState: {
-          ...getCleanAppState(appState),
-          exportBackground: true,
-          viewBackgroundColor:
-            appState.viewBackgroundColor || getCanvasBackground(appTheme),
-        },
-        files: filesRef.current,
-        mimeType: getExportMimeType(format),
-        quality: 0.94,
-        exportPadding: 24,
-      });
+      const viewBackgroundColor =
+        appState.viewBackgroundColor || getCanvasBackground(appTheme);
+      const blob =
+        scope === "area" && areaRect
+          ? await exportAreaToBlob({
+              appState,
+              backgroundColor: viewBackgroundColor,
+              elements,
+              files: filesRef.current,
+              format,
+              rect: areaRect,
+            })
+          : await exportToBlob({
+              elements,
+              appState: {
+                ...getCleanAppState(appState),
+                exportBackground: true,
+                viewBackgroundColor,
+              },
+              files: filesRef.current,
+              mimeType: getExportMimeType(format),
+              quality: 0.94,
+              exportPadding: 24,
+            });
       const bytes = await blobToBytes(blob);
 
       return {
         blob,
         bytes,
-        fileName: getExportFileName(project.title, format),
+        fileName: getExportFileName(project.title, format, scope),
         project,
       };
     },
@@ -3990,6 +4461,272 @@ function App() {
     },
     [buildExportPayload],
   );
+
+  const finishAreaExport = useCallback(
+    async (
+      format: ExportFormat,
+      destination: ExportDestination,
+      areaRect: CanvasRect,
+    ) => {
+      try {
+        const payload = await buildExportPayload(format, "area", areaRect);
+
+        if (!payload) {
+          return;
+        }
+
+        if (destination === "path") {
+          let targetPath = payload.fileName;
+
+          if (isTauri()) {
+            const selectedPath = await saveDialog({
+              defaultPath: payload.fileName,
+              filters: [
+                {
+                  name: getExportLabel(format),
+                  extensions: [getExportExtension(format)],
+                },
+              ],
+              title: `Exportar selecao ${getExportLabel(format)} para`,
+            });
+
+            if (!selectedPath) {
+              setStatus("Exportacao cancelada");
+              return;
+            }
+
+            targetPath = withExportPathExtension(selectedPath, format);
+          }
+
+          const exported = await saveExportToPath(targetPath, payload.bytes, payload.blob);
+
+          setExportedPath(exported.path);
+          setStatus("Exportado");
+          return;
+        }
+
+        const exported = await saveExport(
+          payload.project.id,
+          payload.fileName,
+          payload.bytes,
+          payload.blob,
+        );
+
+        setExportedPath(exported.path);
+        setStatus("Exportado");
+      } catch (error) {
+        console.error(error);
+        setStatus(
+          error instanceof Error && error.message === "AREA_EXPORT_TOO_LARGE"
+            ? "Area grande demais para exportar"
+            : "Falha ao exportar",
+        );
+      }
+    },
+    [buildExportPayload],
+  );
+
+  const beginAreaExport = useCallback(
+    (format: ExportFormat, destination: ExportDestination) => {
+      setIsExportMenuOpen(false);
+
+      if (isGuestCollaborationState(collaborationStateRef.current)) {
+        setStatus("Visitante nao exporta canvas");
+        return;
+      }
+
+      if (!activeProjectRef.current || !appStateRef.current) {
+        setStatus("Selecione um canvas");
+        return;
+      }
+
+      setSelectedAttachmentId(null);
+      setAreaExport({
+        current: null,
+        destination,
+        format,
+        pointerId: null,
+        start: null,
+      });
+      setStatus("Arraste uma area para exportar");
+    },
+    [],
+  );
+
+  const getCanvasHostPoint = useCallback((clientX: number, clientY: number) => {
+    const host = canvasHostRef.current;
+
+    if (!host) {
+      return null;
+    }
+
+    const bounds = host.getBoundingClientRect();
+
+    return clampCanvasPoint(
+      {
+        x: clientX - bounds.left,
+        y: clientY - bounds.top,
+      },
+      bounds,
+    );
+  }, []);
+
+  const canvasHostRectToSceneRect = useCallback((rect: CanvasRect) => {
+    const host = canvasHostRef.current;
+    const appState = excalidrawApiRef.current?.getAppState() ?? appStateRef.current;
+
+    if (!host || !appState) {
+      return null;
+    }
+
+    const bounds = host.getBoundingClientRect();
+    const start = viewportPointToScenePoint(
+      bounds.left + rect.x,
+      bounds.top + rect.y,
+      appState,
+      host,
+    );
+    const end = viewportPointToScenePoint(
+      bounds.left + rect.x + rect.width,
+      bounds.top + rect.y + rect.height,
+      appState,
+      host,
+    );
+
+    return normalizeCanvasRect(start, end);
+  }, []);
+
+  const cancelAreaExport = useCallback(() => {
+    setAreaExport(null);
+    setStatus("Exportacao cancelada");
+  }, []);
+
+  const handleAreaExportPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) {
+        return;
+      }
+
+      const point = getCanvasHostPoint(event.clientX, event.clientY);
+
+      if (!point) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      setAreaExport((current) =>
+        current
+          ? {
+              ...current,
+              current: point,
+              pointerId: event.pointerId,
+              start: point,
+            }
+          : current,
+      );
+    },
+    [getCanvasHostPoint],
+  );
+
+  const handleAreaExportPointerMove = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      const point = getCanvasHostPoint(event.clientX, event.clientY);
+
+      if (!point) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      setAreaExport((current) =>
+        current?.start
+          ? {
+              ...current,
+              current: point,
+            }
+          : current,
+      );
+    },
+    [getCanvasHostPoint],
+  );
+
+  const handleAreaExportPointerUp = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      const currentAreaExport = areaExport;
+      const start = currentAreaExport?.start;
+      const point = getCanvasHostPoint(event.clientX, event.clientY);
+
+      if (!currentAreaExport || !start || !point) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (currentAreaExport.pointerId !== null) {
+        event.currentTarget.releasePointerCapture(currentAreaExport.pointerId);
+      }
+
+      setAreaExport(null);
+
+      const hostRect = normalizeCanvasRect(start, point);
+
+      if (
+        hostRect.width < MIN_AREA_EXPORT_SIZE ||
+        hostRect.height < MIN_AREA_EXPORT_SIZE
+      ) {
+        setStatus("Exportacao cancelada");
+        return;
+      }
+
+      const sceneRect = canvasHostRectToSceneRect(hostRect);
+
+      if (!sceneRect) {
+        setStatus("Falha ao exportar");
+        return;
+      }
+
+      void finishAreaExport(
+        currentAreaExport.format,
+        currentAreaExport.destination,
+        sceneRect,
+      );
+    },
+    [areaExport, canvasHostRectToSceneRect, finishAreaExport, getCanvasHostPoint],
+  );
+
+  const areaExportRect = useMemo(() => {
+    if (!areaExport?.start || !areaExport.current) {
+      return null;
+    }
+
+    return normalizeCanvasRect(areaExport.start, areaExport.current);
+  }, [areaExport]);
+
+  useEffect(() => {
+    if (!areaExport) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cancelAreaExport();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [areaExport, cancelAreaExport]);
+
+  useEffect(() => {
+    if (!activeProject && areaExport) {
+      setAreaExport(null);
+    }
+  }, [activeProject, areaExport]);
 
   const revealExport = useCallback(async () => {
     if (!exportedPath) {
@@ -4098,10 +4835,18 @@ function App() {
     collaboration.status === "hosting" || collaboration.status === "connected";
   const isGuestCollaboration =
     collaboration.role === "guest" && collaboration.status === "connected";
+  const canGuestSaveCopy =
+    isGuestCollaboration && Boolean(collaboration.allowGuestSaveCopy);
   const isReadOnlyCollaboration =
     collaboration.role === "guest" &&
     collaboration.status === "connected" &&
     Boolean(collaboration.readOnly);
+  const canSaveProject =
+    Boolean(activeProject) && (!isGuestCollaboration || canGuestSaveCopy);
+  const canConfirmGuestSave =
+    guestSaveFolderMode === "new"
+      ? Boolean(guestSaveFolderName.trim())
+      : Boolean(guestSaveFolderId);
   const isCollaborationBusy =
     collaboration.status === "starting" ||
     collaboration.status === "joining" ||
@@ -4436,12 +5181,12 @@ function App() {
           <div className="topbar-actions">
             <button
               className="toolbar-button"
-              disabled={!activeProject || isGuestCollaboration}
+              disabled={!canSaveProject}
               onClick={handleManualSave}
               type="button"
             >
               <Save size={16} />
-              <span>Salvar</span>
+              <span>{isGuestCollaboration ? "Salvar copia" : "Salvar"}</span>
             </button>
             <button
               className="toolbar-button"
@@ -4499,6 +5244,25 @@ function App() {
                   <div className="export-menu-divider" />
                   <button
                     className="export-menu-item"
+                    onClick={() => beginAreaExport("png", "project")}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <ImageDown size={15} />
+                    <span>Seleção PNG</span>
+                  </button>
+                  <button
+                    className="export-menu-item"
+                    onClick={() => beginAreaExport("jpeg", "project")}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <ImageDown size={15} />
+                    <span>Seleção JPG</span>
+                  </button>
+                  <div className="export-menu-divider" />
+                  <button
+                    className="export-menu-item"
                     onClick={() => void handleExportToPath("png")}
                     role="menuitem"
                     type="button"
@@ -4514,6 +5278,25 @@ function App() {
                   >
                     <FolderOpen size={15} />
                     <span>JPG para...</span>
+                  </button>
+                  <div className="export-menu-divider" />
+                  <button
+                    className="export-menu-item"
+                    onClick={() => beginAreaExport("png", "path")}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <FolderOpen size={15} />
+                    <span>Seleção PNG para...</span>
+                  </button>
+                  <button
+                    className="export-menu-item"
+                    onClick={() => beginAreaExport("jpeg", "path")}
+                    role="menuitem"
+                    type="button"
+                  >
+                    <FolderOpen size={15} />
+                    <span>Seleção JPG para...</span>
                   </button>
                   {exportedPath ? (
                     <>
@@ -4657,6 +5440,26 @@ function App() {
                   );
                 })}
               </div>
+              {areaExport ? (
+                <div
+                  className="area-export-overlay"
+                  onPointerDown={handleAreaExportPointerDown}
+                  onPointerMove={handleAreaExportPointerMove}
+                  onPointerUp={handleAreaExportPointerUp}
+                  role="presentation"
+                >
+                  {areaExportRect ? (
+                    <div
+                      className="area-export-selection"
+                      style={{
+                        height: `${areaExportRect.height}px`,
+                        transform: `translate3d(${areaExportRect.x}px, ${areaExportRect.y}px, 0)`,
+                        width: `${areaExportRect.width}px`,
+                      }}
+                    />
+                  ) : null}
+                </div>
+              ) : null}
             </>
           ) : (
             <div className="empty-canvas-state">
@@ -4820,7 +5623,16 @@ function App() {
             role="dialog"
           >
             <header className="confirm-header">
-              <strong>Colaboracao</strong>
+              <div className="collaboration-title">
+                <strong>Colaboracao</strong>
+                <span>
+                  {isCollaborationActive
+                    ? collaboration.role === "host"
+                      ? "Sessao ativa neste canvas"
+                      : "Conectado a uma sessao"
+                    : "Compartilhe ou entre em um canvas"}
+                </span>
+              </div>
               <button
                 className="icon-button"
                 onClick={() => setIsCollaborationOpen(false)}
@@ -4833,6 +5645,9 @@ function App() {
             <div className="confirm-body collaboration-body">
               {isCollaborationActive ? (
                 <div className="collaboration-status-card">
+                  <div className="collaboration-status-icon">
+                    <Users size={18} />
+                  </div>
                   <div>
                     <span>
                       {collaboration.role === "host"
@@ -4863,11 +5678,17 @@ function App() {
                       Somente visualizacao
                     </span>
                   ) : null}
+                  {collaboration.allowGuestSaveCopy ? (
+                    <span>
+                      <Save size={14} />
+                      Copia local permitida
+                    </span>
+                  ) : null}
                 </div>
               ) : null}
 
               {collaboration.role === "host" && pendingCollaborationRequests.length ? (
-                <div className="collaboration-section">
+                <div className="collaboration-section collaboration-requests-card">
                   <label>Pedidos de entrada</label>
                   <div className="collaboration-request-list">
                     {pendingCollaborationRequests.map((request) => (
@@ -4924,7 +5745,7 @@ function App() {
               ) : null}
 
               {collaboration.role === "host" && collaboration.code ? (
-                <div className="collaboration-section">
+                <div className="collaboration-section collaboration-code-card">
                   <label htmlFor="collaboration-code">Codigo</label>
                   <textarea
                     id="collaboration-code"
@@ -4973,7 +5794,16 @@ function App() {
 
               {!isCollaborationActive ? (
                 <>
-                  <div className="collaboration-section">
+                  <div className="collaboration-section collaboration-start-card">
+                    <div className="collaboration-section-header">
+                      <div className="collaboration-section-icon">
+                        <Users size={16} />
+                      </div>
+                      <div>
+                        <strong>Hospedar canvas</strong>
+                        <span>Crie um codigo para outra pessoa entrar.</span>
+                      </div>
+                    </div>
                     <div className="collaboration-options">
                       <label className="collaboration-option">
                         <input
@@ -4995,9 +5825,19 @@ function App() {
                         />
                         <span>Visitantes entram somente visualizacao</span>
                       </label>
+                      <label className="collaboration-option">
+                        <input
+                          checked={collaborationAllowGuestSaveCopy}
+                          onChange={(event) =>
+                            setCollaborationAllowGuestSaveCopy(event.currentTarget.checked)
+                          }
+                          type="checkbox"
+                        />
+                        <span>Permitir visitantes salvarem copia local</span>
+                      </label>
                     </div>
                     <button
-                      className="toolbar-button"
+                      className="toolbar-button collaboration-primary-action"
                       disabled={!activeProject || isCollaborationBusy}
                       onClick={() => {
                         void handleStartCollaboration();
@@ -5012,16 +5852,25 @@ function App() {
                       </span>
                     </button>
                   </div>
-                  <div className="collaboration-section">
-                    <label htmlFor="join-collaboration-code">Entrar com codigo</label>
+                  <div className="collaboration-section collaboration-join-card">
+                    <div className="collaboration-section-header">
+                      <div className="collaboration-section-icon">
+                        <Copy size={16} />
+                      </div>
+                      <div>
+                        <strong>Entrar com codigo</strong>
+                        <span>Cole o codigo recebido para conectar.</span>
+                      </div>
+                    </div>
                     <textarea
+                      className="collaboration-code-input"
                       id="join-collaboration-code"
                       onChange={(event) => setJoinCode(event.currentTarget.value)}
                       placeholder="Cole o codigo"
                       value={joinCode}
                     />
                     <button
-                      className="toolbar-button"
+                      className="toolbar-button collaboration-primary-action"
                       disabled={isCollaborationBusy || !joinCode.trim()}
                       onClick={() => {
                         void handleJoinCollaboration();
@@ -5038,12 +5887,14 @@ function App() {
               ) : null}
 
               {collaboration.message ? (
-                <p className="collaboration-message">{collaboration.message}</p>
+                <p className="collaboration-message collaboration-message-card">
+                  {collaboration.message}
+                </p>
               ) : null}
 
-              <div className="collaboration-actions-row">
+              <div className="collaboration-actions-row collaboration-footer-actions">
                 <button
-                  className="toolbar-button"
+                  className="toolbar-button collaboration-log-button"
                   onClick={() => {
                     void handleOpenCollaborationLog();
                   }}
@@ -5306,6 +6157,106 @@ function App() {
               </button>
             </footer>
           </section>
+        </div>
+      ) : null}
+
+      {isGuestSaveDialogOpen ? (
+        <div className="confirm-backdrop" onMouseDown={closeGuestSaveDialog}>
+          <form
+            className="confirm-panel guest-save-panel"
+            onMouseDown={(event) => event.stopPropagation()}
+            onSubmit={(event) => {
+              event.preventDefault();
+              void handleSaveGuestCopy();
+            }}
+          >
+            <header className="confirm-header">
+              <strong>Salvar copia local</strong>
+              <button
+                className="icon-button"
+                disabled={isSavingGuestCopy}
+                onClick={closeGuestSaveDialog}
+                title="Fechar"
+                type="button"
+              >
+                <X size={17} />
+              </button>
+            </header>
+            <div className="confirm-body guest-save-body">
+              <label className="guest-save-field">
+                <span>Nome do canvas</span>
+                <input
+                  autoFocus
+                  className="project-title-input guest-save-input"
+                  maxLength={70}
+                  onChange={(event) => setGuestSaveProjectTitle(event.target.value)}
+                  value={guestSaveProjectTitle}
+                />
+              </label>
+
+              <div className="guest-save-folder-box">
+                <label className="guest-save-choice">
+                  <input
+                    checked={guestSaveFolderMode === "existing"}
+                    disabled={!guestSaveAvailableFolders.length}
+                    onChange={() => setGuestSaveFolderMode("existing")}
+                    type="radio"
+                  />
+                  <span>Escolher pasta existente</span>
+                </label>
+                {guestSaveFolderMode === "existing" ? (
+                  <select
+                    className="guest-save-select"
+                    disabled={!guestSaveAvailableFolders.length}
+                    onChange={(event) => setGuestSaveFolderId(event.target.value)}
+                    value={guestSaveFolderId}
+                  >
+                    {guestSaveAvailableFolders.map((folder) => (
+                      <option key={folder.id} value={folder.id}>
+                        {folder.title}
+                      </option>
+                    ))}
+                  </select>
+                ) : null}
+
+                <label className="guest-save-choice">
+                  <input
+                    checked={guestSaveFolderMode === "new"}
+                    onChange={() => setGuestSaveFolderMode("new")}
+                    type="radio"
+                  />
+                  <span>Criar nova pasta</span>
+                </label>
+                {guestSaveFolderMode === "new" ? (
+                  <input
+                    className="project-title-input guest-save-input"
+                    maxLength={40}
+                    onChange={(event) => setGuestSaveFolderName(event.target.value)}
+                    placeholder="Nome da pasta"
+                    value={guestSaveFolderName}
+                  />
+                ) : null}
+              </div>
+            </div>
+            <footer className="confirm-actions">
+              <button
+                className="toolbar-button"
+                disabled={isSavingGuestCopy}
+                onClick={closeGuestSaveDialog}
+                type="button"
+              >
+                Cancelar
+              </button>
+              <button
+                className="toolbar-button collaboration-primary-action"
+                disabled={isSavingGuestCopy || !canConfirmGuestSave}
+                type="submit"
+              >
+                <Save size={16} />
+                <span>{isSavingGuestCopy ? "Salvando" : "Salvar copia"}</span>
+              </button>
+            </footer>
+          </form>
         </div>
       ) : null}
 

@@ -199,6 +199,13 @@ type SceneViewport = {
   scrollX: number;
   scrollY: number;
   zoom: number;
+  offsetLeft: number;
+  offsetTop: number;
+};
+
+type AppStateWithViewportOffset = Partial<AppState> & {
+  offsetLeft?: number;
+  offsetTop?: number;
 };
 
 type RemoteCursor = {
@@ -732,11 +739,65 @@ function getZoomValue(appState: Partial<AppState> | null | undefined) {
   return zoom?.value || 1;
 }
 
-function getSceneViewport(appState: Partial<AppState> | null | undefined): SceneViewport {
+function getFiniteViewportNumber(value: unknown, fallback: number) {
+  const numeric = Number(value);
+
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function getSceneViewport(
+  appState: Partial<AppState> | null | undefined,
+  host?: HTMLElement | null,
+): SceneViewport {
+  const hostBounds = host?.getBoundingClientRect();
+  const viewportAppState = appState as AppStateWithViewportOffset | null | undefined;
+
   return {
     scrollX: Number(appState?.scrollX || 0),
     scrollY: Number(appState?.scrollY || 0),
     zoom: getZoomValue(appState),
+    offsetLeft: getFiniteViewportNumber(
+      viewportAppState?.offsetLeft,
+      hostBounds?.left ?? 0,
+    ),
+    offsetTop: getFiniteViewportNumber(
+      viewportAppState?.offsetTop,
+      hostBounds?.top ?? 0,
+    ),
+  };
+}
+
+function viewportPointToScenePoint(
+  clientX: number,
+  clientY: number,
+  appState: Partial<AppState>,
+  host?: HTMLElement | null,
+) {
+  const viewport = getSceneViewport(appState, host);
+
+  return {
+    x: (clientX - viewport.offsetLeft) / viewport.zoom - viewport.scrollX,
+    y: (clientY - viewport.offsetTop) / viewport.zoom - viewport.scrollY,
+  };
+}
+
+function scenePointToHostPoint(
+  sceneX: number,
+  sceneY: number,
+  viewport: SceneViewport,
+  host?: HTMLElement | null,
+) {
+  const hostBounds = host?.getBoundingClientRect();
+
+  return {
+    x:
+      (sceneX + viewport.scrollX) * viewport.zoom +
+      viewport.offsetLeft -
+      (hostBounds?.left ?? 0),
+    y:
+      (sceneY + viewport.scrollY) * viewport.zoom +
+      viewport.offsetTop -
+      (hostBounds?.top ?? 0),
   };
 }
 
@@ -1088,6 +1149,8 @@ function App() {
     scrollX: 0,
     scrollY: 0,
     zoom: 1,
+    offsetLeft: 0,
+    offsetTop: 0,
   });
   const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
   const [appTheme, setAppTheme] = useState<AppTheme>(() => getStoredTheme());
@@ -1174,13 +1237,15 @@ function App() {
   }, []);
 
   const syncSceneViewport = useCallback((appState: Partial<AppState> | null | undefined) => {
-    const nextViewport = getSceneViewport(appState);
+    const nextViewport = getSceneViewport(appState, canvasHostRef.current);
 
     setSceneViewport((current) => {
       if (
         Math.abs(current.scrollX - nextViewport.scrollX) < 0.5 &&
         Math.abs(current.scrollY - nextViewport.scrollY) < 0.5 &&
-        Math.abs(current.zoom - nextViewport.zoom) < 0.001
+        Math.abs(current.zoom - nextViewport.zoom) < 0.001 &&
+        Math.abs(current.offsetLeft - nextViewport.offsetLeft) < 0.5 &&
+        Math.abs(current.offsetTop - nextViewport.offsetTop) < 0.5
       ) {
         return current;
       }
@@ -2652,16 +2717,29 @@ function App() {
   const getAttachmentInsertPosition = useCallback(
     (size: { width: number; height: number }) => {
       const host = canvasHostRef.current;
-      const viewportWidth = host?.clientWidth || 900;
-      const viewportHeight = host?.clientHeight || 640;
-      const zoom = sceneViewport.zoom || 1;
+      const appState = excalidrawApiRef.current?.getAppState() ?? appStateRef.current;
+
+      if (host && appState) {
+        const bounds = host.getBoundingClientRect();
+        const center = viewportPointToScenePoint(
+          bounds.left + bounds.width / 2,
+          bounds.top + bounds.height / 2,
+          appState,
+          host,
+        );
+
+        return {
+          x: center.x - size.width / 2,
+          y: center.y - size.height / 2,
+        };
+      }
 
       return {
-        x: (viewportWidth / 2 - sceneViewport.scrollX) / zoom - size.width / 2,
-        y: (viewportHeight / 2 - sceneViewport.scrollY) / zoom - size.height / 2,
+        x: -size.width / 2,
+        y: -size.height / 2,
       };
     },
-    [sceneViewport],
+    [],
   );
 
   const markAttachmentsChanged = useCallback(
@@ -3015,13 +3093,7 @@ function App() {
       return null;
     }
 
-    const rect = host.getBoundingClientRect();
-    const zoom = getZoomValue(appState);
-
-    return {
-      x: (clientX - rect.left - Number(appState.scrollX || 0)) / zoom,
-      y: (clientY - rect.top - Number(appState.scrollY || 0)) / zoom,
-    };
+    return viewportPointToScenePoint(clientX, clientY, appState, host);
   }, []);
 
   const handleCanvasPointerMoveCapture = useCallback(
@@ -3147,23 +3219,17 @@ function App() {
 
   const handleCanvasDoubleClick = useCallback(
     (event: React.MouseEvent<HTMLDivElement>) => {
-      const api = excalidrawApiRef.current;
-      const host = canvasHostRef.current;
-      const appState = api?.getAppState() ?? appStateRef.current;
+      const point = getCanvasScenePoint(event.clientX, event.clientY);
 
-      if (!host || !appState) {
+      if (!point) {
         return;
       }
 
-      const rect = host.getBoundingClientRect();
-      const zoom = getZoomValue(appState);
-      const sceneX = (event.clientX - rect.left - appState.scrollX) / zoom;
-      const sceneY = (event.clientY - rect.top - appState.scrollY) / zoom;
       const attachment = getNativeVideoAttachmentAtPoint(
         attachmentsRef.current,
         elementsRef.current,
-        sceneX,
-        sceneY,
+        point.x,
+        point.y,
       );
 
       if (!attachment) {
@@ -3174,7 +3240,7 @@ function App() {
       event.stopPropagation();
       setVideoPlayerAttachment(attachment);
     },
-    [],
+    [getCanvasScenePoint],
   );
 
   const handleAttachmentSelect = useCallback((attachmentId: string) => {
@@ -4541,37 +4607,55 @@ function App() {
               <div className="attachment-layer" aria-label="Anexos do canvas">
                 {attachments
                   .filter((attachment) => attachment.displayMode !== "native")
-                  .map((attachment) => (
-                    <AttachmentPreview
-                      attachment={attachment}
-                      key={attachment.id}
-                      left={attachment.x * sceneViewport.zoom + sceneViewport.scrollX}
-                      onDelete={(attachmentId) => {
-                        void removeAttachmentById(attachmentId);
-                      }}
-                      onDragHandlePointerDown={handleAttachmentDragStart}
-                      onOpen={handleOpenAttachment}
-                      onSelect={handleAttachmentSelect}
-                      selected={selectedAttachmentId === attachment.id}
-                      top={attachment.y * sceneViewport.zoom + sceneViewport.scrollY}
-                      zoom={sceneViewport.zoom}
-                    />
-                  ))}
+                  .map((attachment) => {
+                    const position = scenePointToHostPoint(
+                      attachment.x,
+                      attachment.y,
+                      sceneViewport,
+                      canvasHostRef.current,
+                    );
+
+                    return (
+                      <AttachmentPreview
+                        attachment={attachment}
+                        key={attachment.id}
+                        left={position.x}
+                        onDelete={(attachmentId) => {
+                          void removeAttachmentById(attachmentId);
+                        }}
+                        onDragHandlePointerDown={handleAttachmentDragStart}
+                        onOpen={handleOpenAttachment}
+                        onSelect={handleAttachmentSelect}
+                        selected={selectedAttachmentId === attachment.id}
+                        top={position.y}
+                        zoom={sceneViewport.zoom}
+                      />
+                    );
+                  })}
               </div>
               <div className="remote-cursor-layer" aria-hidden="true">
-                {remoteCursors.map((cursor) => (
-                  <div
-                    className="remote-cursor"
-                    key={cursor.peerId}
-                    style={{
-                      color: cursor.color,
-                      transform: `translate3d(${cursor.x * sceneViewport.zoom + sceneViewport.scrollX}px, ${cursor.y * sceneViewport.zoom + sceneViewport.scrollY}px, 0)`,
-                    }}
-                  >
-                    <MousePointer2 size={18} />
-                    <span style={{ backgroundColor: cursor.color }}>{cursor.label}</span>
-                  </div>
-                ))}
+                {remoteCursors.map((cursor) => {
+                  const position = scenePointToHostPoint(
+                    cursor.x,
+                    cursor.y,
+                    sceneViewport,
+                    canvasHostRef.current,
+                  );
+
+                  return (
+                    <div
+                      className="remote-cursor"
+                      key={cursor.peerId}
+                      style={{
+                        color: cursor.color,
+                        transform: `translate3d(${position.x}px, ${position.y}px, 0)`,
+                      }}
+                    >
+                      <MousePointer2 size={18} />
+                      <span style={{ backgroundColor: cursor.color }}>{cursor.label}</span>
+                    </div>
+                  );
+                })}
               </div>
             </>
           ) : (

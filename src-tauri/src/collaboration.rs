@@ -28,6 +28,7 @@ const MAX_WIRE_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ENCRYPTED_WIRE_MESSAGE_BYTES: usize = MAX_WIRE_MESSAGE_BYTES + 128;
 const MAX_COLLABORATION_PEERS: usize = 4;
 const JOIN_APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+const GUEST_WELCOME_TIMEOUT: Duration = Duration::from_secs(75);
 const PEER_RATE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_SCENE_UPDATES_PER_WINDOW: usize = 30;
 
@@ -374,7 +375,7 @@ fn join_collaboration_session_inner<S: CollaborationEventSink>(
             Ok(mut stream) => {
                 append_debug_log(&format!("native guest_connected endpoint={endpoint}"));
                 stream.set_nodelay(true).ok();
-                stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
+                stream.set_read_timeout(Some(GUEST_WELCOME_TIMEOUT)).ok();
 
                 send_wire_message(
                     &mut stream,

@@ -1,47 +1,93 @@
 # Excalibur
 
-Excalibur is a lightweight Windows desktop whiteboard built with Tauri, React,
-Vite, and the official Excalidraw canvas package.
+Excalibur is a lightweight desktop whiteboard built on top of the official
+Excalidraw canvas package. It keeps the familiar drawing experience while adding
+local project organization, file attachments, export tools, and experimental
+peer-to-peer collaboration.
 
-## Features
+## Download
 
-- **Local Sidebar Organization:** Manage folders and canvases/projects with support for creating, renaming, switching, searching, and deleting.
-- **Drag & Drop Workspace:** Move canvases between folders by dragging them directly in the sidebar, or reorder them within a folder to organize your workflow. Folder movements on the OS filesystem level are processed instantly and safely by the Rust backend.
-- **Custom Folder Colors:** Personalize each folder with a modern color palette from a custom picker, allowing for quick visual recognition in the sidebar.
-- **Excalidraw Tools:** Full support for shapes, arrows, free drawing, sticky notes, text, frames, image imports, zoom, selection, undo/redo, and built-in scene actions.
-- **Native Titlebar Color Sync:** On Windows, the native window titlebar automatically synchronizes and matches the sidebar's background color, adjusting instantly for both light and dark themes.
-- **External Web Redirection:** External links and the Excalidraw library finder button automatically open in your default system web browser, allowing you to easily browse, download, and import libraries.
-- **Autosave & Customizable Path:** Saves progress automatically to the disk. Uses `%USERPROFILE%\Documents\Excalibur` by default, but the storage path can be customized through the settings panel.
-- **Export Options:** Easily export active boards to high-quality PNG or JPG files.
-- **Lightweight Runtime:** Powered by Tauri and Windows WebView2 instead of Electron, utilizing minimal system resources.
+Get the latest release from GitHub:
 
-## Windows Development
+[Download Excalibur v0.4.4](https://github.com/c00rvus/excalibur/releases/tag/v0.4.4)
 
-This machine needs the Windows certificate store for npm and a Cargo revocation
-check override for first-time Rust dependency downloads:
+Common installers:
+
+- [Windows setup `.exe`](https://github.com/c00rvus/excalibur/releases/download/v0.4.4/Excalibur_0.4.4_x64-setup.exe)
+- [Windows `.msi`](https://github.com/c00rvus/excalibur/releases/download/v0.4.4/Excalibur_0.4.4_x64_en-US.msi)
+- [macOS universal `.dmg`](https://github.com/c00rvus/excalibur/releases/download/v0.4.4/Excalibur_0.4.4_universal.dmg)
+- [Linux AppImage](https://github.com/c00rvus/excalibur/releases/download/v0.4.4/Excalibur_0.4.4_amd64.AppImage)
+
+## Highlights
+
+- **Excalidraw drawing tools:** shapes, arrows, freehand drawing, text, frames,
+  images, selection, zoom, undo/redo, and scene actions.
+- **Folder-based workspace:** organize canvases into folders, search them,
+  reorder them, and move canvases between folders with drag and drop.
+- **File attachments:** attach files as icons or previews. Text, PDF, images,
+  and supported native previews are converted into canvas elements when
+  possible. Videos can be opened in the built-in player from the canvas.
+- **Export tools:** export the full canvas or drag-select an area and save it as
+  PNG or JPG. Exports can go into the project folder or to a path you choose.
+- **Local-first storage:** projects are saved on disk by default under
+  `Documents\Excalibur`, with a settings option to choose another location.
+- **Light and dark themes:** theme-aware UI and canvas background handling.
+- **Peer-to-peer collaboration:** host a session, approve guests, allow
+  edit-only or view-only access, and optionally allow guests to save a local copy
+  of the shared canvas.
+- **Lightweight runtime:** powered by Tauri and the system WebView instead of
+  Electron.
+
+## Storage Layout
+
+By default, Excalibur stores projects under:
+
+```text
+%USERPROFILE%\Documents\Excalibur
+```
+
+Each saved project uses a predictable folder structure:
+
+```text
+projects\<folder>\<project>\canvas\scene.excalidraw
+projects\<folder>\<project>\attachments
+projects\<folder>\<project>\exports\png
+projects\<folder>\<project>\exports\jpg
+projects\<folder>\<project>\exports\files
+```
+
+You can change the storage root from the settings panel.
+
+## Development
+
+Requirements:
+
+- Node.js and npm
+- Rust and Cargo
+- Tauri prerequisites for your platform
+
+Install dependencies and run the desktop app in development mode:
 
 ```powershell
-$env:NODE_OPTIONS='--use-system-ca'
-$env:CARGO_HTTP_CHECK_REVOKE='false'
 npm.cmd install
 npm.cmd run tauri:dev
 ```
 
-For a production build:
+Create a production desktop build:
+
+```powershell
+npm.cmd run tauri:build
+```
+
+On some Windows environments, first-time dependency downloads may need the
+system certificate store or a Cargo revocation-check override:
 
 ```powershell
 $env:NODE_OPTIONS='--use-system-ca'
 $env:CARGO_HTTP_CHECK_REVOKE='false'
-npm.cmd run tauri:build
 ```
 
-Projects are stored under `%USERPROFILE%\Documents\Excalibur` by default. The
-root can be changed from the settings panel.
+## Release Builds
 
-Each project uses this structure:
-
-```text
-projects\<folder>\<project>\canvas\scene.excalidraw
-projects\<folder>\<project>\exports\png
-projects\<folder>\<project>\exports\jpg
-```
+Pushing a tag like `v0.4.4` runs the GitHub Actions release workflow and
+publishes installers for Windows, macOS, and Linux.

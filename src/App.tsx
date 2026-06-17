@@ -41,6 +41,7 @@ import {
   ImageDown,
   Layers3,
   Moon,
+  MousePointer2,
   Paperclip,
   Pencil,
   Plus,
@@ -102,6 +103,7 @@ import {
   getCollaborationStatus,
   joinCollaborationSession,
   respondCollaborationJoinRequest,
+  sendCollaborationCursorUpdate,
   sendCollaborationUpdate,
   startCollaborationSession,
   stopCollaborationSession,
@@ -174,8 +176,18 @@ const THEME_STORAGE_KEY = "excalibur.theme";
 const LAST_LIGHT_BG_KEY = "excalibur.lastLightBg";
 const LAST_DARK_BG_KEY = "excalibur.lastDarkBg";
 const MAX_DROPPED_ATTACHMENT_BYTES = 128 * 1024 * 1024;
-const COLLABORATION_LOCKS_PAYLOAD_KEY = "excaliburCollaborationLocks";
-const COLLABORATION_ELEMENT_LOCK_MS = 2_400;
+const COLLABORATION_SCENE_UPDATE_DELAY_MS = 60;
+const COLLABORATION_CURSOR_UPDATE_DELAY_MS = 32;
+const COLLABORATION_REMOTE_APPLY_GUARD_MS = 120;
+const REMOTE_CURSOR_TTL_MS = 2_400;
+const REMOTE_CURSOR_COLORS = [
+  "#80CBC4",
+  "#7AA2F7",
+  "#F7768E",
+  "#E0AF68",
+  "#9ECE6A",
+  "#BB9AF7",
+];
 
 type CanvasInitialData = {
   elements: readonly ExcalidrawElement[];
@@ -189,10 +201,21 @@ type SceneViewport = {
   zoom: number;
 };
 
-type CollaborationElementLock = {
+type RemoteCursor = {
   peerId: string;
+  label: string;
+  color: string;
+  x: number;
+  y: number;
+  visible: boolean;
   updatedAt: number;
-  expiresAt: number;
+};
+
+type CollaborationCursorPayload = {
+  x: number;
+  y: number;
+  visible: boolean;
+  revision?: number;
 };
 
 function isDragInsideCurrentTarget(event: React.DragEvent<HTMLElement>) {
@@ -724,69 +747,6 @@ function getStoredCanvasAttachments(payload: Record<string, unknown>) {
   );
 }
 
-function getStoredCollaborationLocks(payload: Record<string, unknown>) {
-  const rawLocks = payload[COLLABORATION_LOCKS_PAYLOAD_KEY];
-
-  if (!rawLocks || typeof rawLocks !== "object" || Array.isArray(rawLocks)) {
-    return {};
-  }
-
-  const now = Date.now();
-  const locks: Record<string, CollaborationElementLock> = {};
-
-  Object.entries(rawLocks as Record<string, unknown>).forEach(([elementId, rawLock]) => {
-    if (!rawLock || typeof rawLock !== "object" || Array.isArray(rawLock)) {
-      return;
-    }
-
-    const lock = rawLock as Partial<CollaborationElementLock>;
-    if (
-      typeof lock.peerId !== "string" ||
-      typeof lock.updatedAt !== "number" ||
-      typeof lock.expiresAt !== "number" ||
-      lock.expiresAt <= now
-    ) {
-      return;
-    }
-
-    locks[elementId] = {
-      peerId: lock.peerId,
-      updatedAt: lock.updatedAt,
-      expiresAt: lock.expiresAt,
-    };
-  });
-
-  return locks;
-}
-
-function pruneCollaborationLocks(
-  locks: Record<string, CollaborationElementLock>,
-  now = Date.now(),
-) {
-  return Object.fromEntries(
-    Object.entries(locks).filter(([, lock]) => lock.expiresAt > now),
-  ) as Record<string, CollaborationElementLock>;
-}
-
-function addCollaborationLocksToPayload(
-  payload: string,
-  locks: Record<string, CollaborationElementLock>,
-) {
-  const activeLocks = pruneCollaborationLocks(locks);
-
-  if (!Object.keys(activeLocks).length) {
-    return payload;
-  }
-
-  try {
-    const parsed = JSON.parse(payload);
-    parsed[COLLABORATION_LOCKS_PAYLOAD_KEY] = activeLocks;
-    return JSON.stringify(parsed);
-  } catch {
-    return payload;
-  }
-}
-
 function getChangedElementIds(
   previousElements: readonly ExcalidrawElement[],
   nextElements: readonly ExcalidrawElement[],
@@ -816,58 +776,50 @@ function getChangedElementIds(
   return changedIds;
 }
 
-function replaceLockedElementChanges(
-  previousElements: readonly ExcalidrawElement[],
-  nextElements: readonly ExcalidrawElement[],
-  blockedIds: Set<string>,
-) {
-  if (!blockedIds.size) {
-    return nextElements;
+function getRemoteCursorColor(peerId: string) {
+  let hash = 0;
+
+  for (const character of peerId) {
+    hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
   }
 
-  const previousById = new Map(previousElements.map((element) => [element.id, element]));
-  const nextIds = new Set(nextElements.map((element) => element.id));
-  const merged = nextElements.map((element) =>
-    blockedIds.has(element.id) ? previousById.get(element.id) ?? element : element,
-  );
-
-  previousElements.forEach((element) => {
-    if (blockedIds.has(element.id) && !nextIds.has(element.id)) {
-      merged.push(element);
-    }
-  });
-
-  return merged;
+  return REMOTE_CURSOR_COLORS[hash % REMOTE_CURSOR_COLORS.length];
 }
 
-function preserveLocallyLockedElements(
-  remoteElements: readonly ExcalidrawElement[],
-  currentElements: readonly ExcalidrawElement[],
-  localLocks: Record<string, CollaborationElementLock>,
-  localPeerId: string | undefined,
-  now = Date.now(),
-) {
-  if (!localPeerId) {
-    return remoteElements;
+function getRemoteCursorLabel(peerId: string) {
+  const compact = peerId.trim().replace(/[^a-z0-9]/gi, "").slice(0, 4);
+
+  return compact ? compact.toUpperCase() : "PEER";
+}
+
+function parseCollaborationCursorPayload(
+  payload: string | null | undefined,
+): CollaborationCursorPayload | null {
+  if (!payload) {
+    return null;
   }
 
-  const currentById = new Map(currentElements.map((element) => [element.id, element]));
-  const remoteIds = new Set(remoteElements.map((element) => element.id));
-  const isLocallyLocked = (elementId: string) => {
-    const lock = localLocks[elementId];
-    return lock?.peerId === localPeerId && lock.expiresAt > now;
-  };
-  const merged = remoteElements.map((element) =>
-    isLocallyLocked(element.id) ? currentById.get(element.id) ?? element : element,
-  );
+  try {
+    const parsed = JSON.parse(payload) as Partial<CollaborationCursorPayload>;
+    const x = Number(parsed.x);
+    const y = Number(parsed.y);
 
-  currentElements.forEach((element) => {
-    if (isLocallyLocked(element.id) && !remoteIds.has(element.id)) {
-      merged.push(element);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      return null;
     }
-  });
 
-  return merged;
+    return {
+      x,
+      y,
+      visible: parsed.visible !== false,
+      revision:
+        typeof parsed.revision === "number" && Number.isFinite(parsed.revision)
+          ? parsed.revision
+          : undefined,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function preserveLocalViewport(
@@ -1102,6 +1054,7 @@ function App() {
   const autoSaveTimerRef = useRef<number | null>(null);
   const collaborationUpdateTimerRef = useRef<number | null>(null);
   const collaborationInitialApplyTimerRef = useRef<number | null>(null);
+  const collaborationCursorUpdateTimerRef = useRef<number | null>(null);
   const remoteApplyTimerRef = useRef<number | null>(null);
   const themeApplyTimerRef = useRef<number | null>(null);
   const activeProjectRef = useRef<ProjectMetadata | null>(null);
@@ -1112,10 +1065,14 @@ function App() {
   const lastKnownSignatureRef = useRef("");
   const lastSavedSignatureRef = useRef("");
   const lastCollaborationFilesSignatureRef = useRef("");
+  const lastCollaborationSceneSentAtRef = useRef(0);
   const applyingRemoteSceneRef = useRef(false);
   const collaborationStateRef = useRef<CollaborationUiState>({ status: "idle" });
-  const localElementLocksRef = useRef<Record<string, CollaborationElementLock>>({});
-  const remoteElementLocksRef = useRef<Record<string, CollaborationElementLock>>({});
+  const pendingCursorUpdateRef = useRef<{
+    x: number;
+    y: number;
+    visible: boolean;
+  } | null>(null);
 
   const [projects, setProjects] = useState<ProjectMetadata[]>([]);
   const [folders, setFolders] = useState<ProjectFolder[]>(() => getStoredFolders());
@@ -1132,6 +1089,7 @@ function App() {
     scrollY: 0,
     zoom: 1,
   });
+  const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
   const [appTheme, setAppTheme] = useState<AppTheme>(() => getStoredTheme());
   const [collapsedFolderIds, setCollapsedFolderIds] = useState<Set<string>>(
     () => new Set(),
@@ -1531,6 +1489,15 @@ function App() {
     }
   }, []);
 
+  const clearCollaborationCursorUpdate = useCallback(() => {
+    if (collaborationCursorUpdateTimerRef.current) {
+      window.clearTimeout(collaborationCursorUpdateTimerRef.current);
+      collaborationCursorUpdateTimerRef.current = null;
+    }
+
+    pendingCursorUpdateRef.current = null;
+  }, []);
+
   const getCurrentCollaborationPayload = useCallback((options?: { includeFiles?: boolean }) => {
     const appState = appStateRef.current;
 
@@ -1538,15 +1505,13 @@ function App() {
       return null;
     }
 
-    const payload = getCanvasPayload(
+    return getCanvasPayload(
       elementsRef.current,
       appState,
       filesRef.current,
       attachmentsRef.current,
       options,
     );
-
-    return addCollaborationLocksToPayload(payload, localElementLocksRef.current);
   }, []);
 
   const sendCurrentCollaborationPayload = useCallback(async () => {
@@ -1577,14 +1542,8 @@ function App() {
     }
 
     try {
-      logCollaborationDebug(
-        `send_start status=${current.status} role=${current.role ?? "none"} includeFiles=${includeFiles} ${summarizeCollaborationPayload(payload)}`,
-      );
       await sendCollaborationUpdate(payload);
       lastCollaborationFilesSignatureRef.current = filesSignature;
-      logCollaborationDebug(
-        `send_ok status=${current.status} role=${current.role ?? "none"}`,
-      );
     } catch (error) {
       console.warn("Failed to send collaboration update", error);
       logCollaborationDebug(
@@ -1608,15 +1567,73 @@ function App() {
       return;
     }
 
-    clearCollaborationUpdate();
+    if (collaborationUpdateTimerRef.current) {
+      return;
+    }
+
+    const elapsed = Date.now() - lastCollaborationSceneSentAtRef.current;
+    const delay = Math.max(0, COLLABORATION_SCENE_UPDATE_DELAY_MS - elapsed);
+
     collaborationUpdateTimerRef.current = window.setTimeout(() => {
       collaborationUpdateTimerRef.current = null;
-      logCollaborationDebug(
-        `send_timer_fire status=${collaborationStateRef.current.status} role=${collaborationStateRef.current.role ?? "none"}`,
-      );
+      lastCollaborationSceneSentAtRef.current = Date.now();
       void sendCurrentCollaborationPayload();
-    }, 280);
-  }, [clearCollaborationUpdate, sendCurrentCollaborationPayload]);
+    }, delay);
+  }, [sendCurrentCollaborationPayload]);
+
+  const flushCollaborationCursorUpdate = useCallback(async () => {
+    const nextCursor = pendingCursorUpdateRef.current;
+    pendingCursorUpdateRef.current = null;
+
+    if (!nextCursor) {
+      return;
+    }
+
+    const current = collaborationStateRef.current;
+    if (
+      current.status !== "hosting" &&
+      current.status !== "connected"
+    ) {
+      return;
+    }
+
+    try {
+      await sendCollaborationCursorUpdate(
+        nextCursor.x,
+        nextCursor.y,
+        nextCursor.visible,
+      );
+    } catch (error) {
+      logCollaborationDebug(
+        `cursor_send_error status=${current.status} role=${current.role ?? "none"} error=${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }, []);
+
+  const scheduleCollaborationCursorUpdate = useCallback(
+    (cursor: { x: number; y: number; visible: boolean }) => {
+      const current = collaborationStateRef.current;
+
+      if (
+        current.status !== "hosting" &&
+        current.status !== "connected"
+      ) {
+        return;
+      }
+
+      pendingCursorUpdateRef.current = cursor;
+
+      if (collaborationCursorUpdateTimerRef.current) {
+        return;
+      }
+
+      collaborationCursorUpdateTimerRef.current = window.setTimeout(() => {
+        collaborationCursorUpdateTimerRef.current = null;
+        void flushCollaborationCursorUpdate();
+      }, COLLABORATION_CURSOR_UPDATE_DELAY_MS);
+    },
+    [flushCollaborationCursorUpdate],
+  );
 
   const stopCollaborationForCanvasSwitch = useCallback(async () => {
     const current = collaborationStateRef.current;
@@ -1627,17 +1644,21 @@ function App() {
 
     clearCollaborationUpdate();
     clearInitialCollaborationApply();
+    clearCollaborationCursorUpdate();
     logCollaborationDebug(
       `stop_for_canvas_switch status=${current.status} role=${current.role ?? "none"}`,
     );
     await stopCollaborationSession();
     lastCollaborationFilesSignatureRef.current = "";
-    localElementLocksRef.current = {};
-    remoteElementLocksRef.current = {};
     setPendingCollaborationRequests([]);
+    setRemoteCursors([]);
     setCollaboration({ status: "idle" });
     setJoinCode("");
-  }, [clearCollaborationUpdate, clearInitialCollaborationApply]);
+  }, [
+    clearCollaborationCursorUpdate,
+    clearCollaborationUpdate,
+    clearInitialCollaborationApply,
+  ]);
 
   const openProject = useCallback(
     async (project: ProjectMetadata) => {
@@ -1894,6 +1915,7 @@ function App() {
       clearAutoSave();
       clearCollaborationUpdate();
       clearInitialCollaborationApply();
+      clearCollaborationCursorUpdate();
       if (themeApplyTimerRef.current) {
         window.clearTimeout(themeApplyTimerRef.current);
         themeApplyTimerRef.current = null;
@@ -1903,7 +1925,12 @@ function App() {
         remoteApplyTimerRef.current = null;
       }
     };
-  }, [clearAutoSave, clearCollaborationUpdate, clearInitialCollaborationApply]);
+  }, [
+    clearAutoSave,
+    clearCollaborationCursorUpdate,
+    clearCollaborationUpdate,
+    clearInitialCollaborationApply,
+  ]);
 
   const handleCanvasChange = useCallback(
     (
@@ -1946,83 +1973,6 @@ function App() {
             `local_change_blocked reason=read_only changedElements=${Array.from(changedIds).join(",")}`,
           );
           return;
-        }
-      }
-
-      if (
-        !applyingRemoteSceneRef.current &&
-        (currentCollaboration.status === "hosting" ||
-          currentCollaboration.status === "connected") &&
-        currentCollaboration.peerId
-      ) {
-        const now = Date.now();
-        remoteElementLocksRef.current = pruneCollaborationLocks(
-          remoteElementLocksRef.current,
-          now,
-        );
-        localElementLocksRef.current = pruneCollaborationLocks(
-          localElementLocksRef.current,
-          now,
-        );
-
-        const changedIds = getChangedElementIds(previousElements, elements);
-        const blockedIds = new Set<string>();
-
-        changedIds.forEach((elementId) => {
-          const lock = remoteElementLocksRef.current[elementId];
-          if (lock && lock.peerId !== currentCollaboration.peerId && lock.expiresAt > now) {
-            blockedIds.add(elementId);
-          }
-        });
-
-        if (blockedIds.size) {
-          const api = excalidrawApiRef.current;
-          const revertedElements = replaceLockedElementChanges(
-            previousElements,
-            elements,
-            blockedIds,
-          );
-
-          applyingRemoteSceneRef.current = true;
-          if (remoteApplyTimerRef.current) {
-            window.clearTimeout(remoteApplyTimerRef.current);
-          }
-          remoteApplyTimerRef.current = window.setTimeout(() => {
-            applyingRemoteSceneRef.current = false;
-            remoteApplyTimerRef.current = null;
-          }, 180);
-
-          elementsRef.current = revertedElements;
-          appStateRef.current = themedAppState;
-          filesRef.current = files;
-          syncSceneViewport(themedAppState);
-
-          if (api) {
-            api.updateScene({
-              elements: revertedElements,
-              appState: themedAppState,
-              captureUpdate: CaptureUpdateAction.IMMEDIATELY,
-            });
-            api.refresh();
-          }
-
-          setStatus("Elemento em uso por outro colaborador");
-          logCollaborationDebug(
-            `local_change_blocked lockedElements=${Array.from(blockedIds).join(",")} owner=${Array.from(blockedIds).map((id) => remoteElementLocksRef.current[id]?.peerId).filter(Boolean).join(",")}`,
-          );
-          return;
-        }
-
-        if (changedIds.size) {
-          const lock: CollaborationElementLock = {
-            peerId: currentCollaboration.peerId,
-            updatedAt: now,
-            expiresAt: now + COLLABORATION_ELEMENT_LOCK_MS,
-          };
-
-          changedIds.forEach((elementId) => {
-            localElementLocksRef.current[elementId] = lock;
-          });
         }
       }
 
@@ -2131,21 +2081,9 @@ function App() {
   const applyCollaborationPayload = useCallback(
     (payload: string, role?: CollaborationRole | null, canvasId?: string | null) => {
       try {
-        logCollaborationDebug(
-          `apply_start incomingRole=${role ?? "none"} currentRole=${collaborationStateRef.current.role ?? "none"} canvas=${canvasId ?? "none"} ${summarizeCollaborationPayload(payload)}`,
-        );
         const parsed = JSON.parse(payload);
         const api = excalidrawApiRef.current;
         const localAppState = api?.getAppState() ?? appStateRef.current;
-        const incomingLocks = getStoredCollaborationLocks(parsed);
-        const localPeerId = collaborationStateRef.current.peerId;
-        const now = Date.now();
-        remoteElementLocksRef.current = {
-          ...pruneCollaborationLocks(remoteElementLocksRef.current, now),
-          ...Object.fromEntries(
-            Object.entries(incomingLocks).filter(([, lock]) => lock.peerId !== localPeerId),
-          ),
-        };
         const restoredAttachments = getStoredCanvasAttachments(parsed);
         const mergedPayloadFiles = mergeBinaryFiles(filesRef.current, getPayloadFiles(parsed));
         if (Object.keys(mergedPayloadFiles).length > 0) {
@@ -2156,17 +2094,7 @@ function App() {
           repairBindings: true,
         });
         const restoredFiles = restored.files ?? mergedPayloadFiles;
-        localElementLocksRef.current = pruneCollaborationLocks(
-          localElementLocksRef.current,
-          now,
-        );
-        const restoredElements = preserveLocallyLockedElements(
-          restored.elements,
-          elementsRef.current,
-          localElementLocksRef.current,
-          localPeerId,
-          now,
-        );
+        const restoredElements = restored.elements;
         const title =
           (typeof restored.appState?.name === "string" && restored.appState.name.trim()) ||
           activeProjectRef.current?.title ||
@@ -2198,7 +2126,7 @@ function App() {
         remoteApplyTimerRef.current = window.setTimeout(() => {
           applyingRemoteSceneRef.current = false;
           remoteApplyTimerRef.current = null;
-        }, 500);
+        }, COLLABORATION_REMOTE_APPLY_GUARD_MS);
 
         if (
           project &&
@@ -2254,17 +2182,11 @@ function App() {
           isDirtyRef.current = false;
           setIsDirty(false);
           setStatus("Colaborando");
-          logCollaborationDebug(
-            `apply_ok target=guest elements=${restoredElements.length} files=${Object.keys(restoredFiles).length}`,
-          );
         } else {
           isDirtyRef.current = true;
           setIsDirty(true);
           setStatus("Atualizado por visitante");
           scheduleAutoSave();
-          logCollaborationDebug(
-            `apply_ok target=host elements=${restoredElements.length} files=${Object.keys(restoredFiles).length}`,
-          );
         }
       } catch (error) {
         console.error("Failed to apply collaboration payload", error);
@@ -2431,14 +2353,14 @@ function App() {
     try {
       clearCollaborationUpdate();
       clearInitialCollaborationApply();
+      clearCollaborationCursorUpdate();
       await stopCollaborationSession();
       logCollaborationDebug("stop_ui_native_ok");
     } finally {
       lastCollaborationFilesSignatureRef.current = "";
-      localElementLocksRef.current = {};
-      remoteElementLocksRef.current = {};
       setCollaboration({ status: "idle" });
       setPendingCollaborationRequests([]);
+      setRemoteCursors([]);
       setJoinCode("");
       setStatus("Colaboracao encerrada");
 
@@ -2447,7 +2369,12 @@ function App() {
         await clearActiveCanvas("Colaboracao encerrada");
       }
     }
-  }, [clearActiveCanvas, clearCollaborationUpdate, clearInitialCollaborationApply]);
+  }, [
+    clearActiveCanvas,
+    clearCollaborationCursorUpdate,
+    clearCollaborationUpdate,
+    clearInitialCollaborationApply,
+  ]);
 
   const handleOpenCollaborationLog = useCallback(async () => {
     try {
@@ -2545,12 +2472,50 @@ function App() {
       }
 
       const payload = event.payload;
-      logCollaborationDebug(
-        `event_received kind=${payload.kind} role=${payload.role ?? "none"} session=${payload.sessionId ?? "none"} canvas=${payload.canvasId ?? "none"} peers=${payload.peerCount ?? "none"} message=${payload.message ?? "none"} ${summarizeCollaborationPayload(payload.payload)}`,
-      );
+      if (payload.kind !== "cursorUpdate" && payload.kind !== "sceneUpdate") {
+        logCollaborationDebug(
+          `event_received kind=${payload.kind} role=${payload.role ?? "none"} session=${payload.sessionId ?? "none"} canvas=${payload.canvasId ?? "none"} peers=${payload.peerCount ?? "none"} message=${payload.message ?? "none"} ${summarizeCollaborationPayload(payload.payload)}`,
+        );
+      }
 
       if (payload.kind === "sceneUpdate" && payload.payload) {
         applyCollaborationPayload(payload.payload, payload.role, payload.canvasId);
+        return;
+      }
+
+      if (payload.kind === "cursorUpdate" && payload.peerId) {
+        const peerId = payload.peerId;
+        const cursor = parseCollaborationCursorPayload(payload.payload);
+
+        if (!cursor || !cursor.visible) {
+          setRemoteCursors((current) =>
+            current.filter((item) => item.peerId !== peerId),
+          );
+          return;
+        }
+
+        setRemoteCursors((current) => {
+          const nextCursor: RemoteCursor = {
+            peerId,
+            label: getRemoteCursorLabel(peerId),
+            color: getRemoteCursorColor(peerId),
+            x: cursor.x,
+            y: cursor.y,
+            visible: true,
+            updatedAt: Date.now(),
+          };
+          const existingIndex = current.findIndex(
+            (item) => item.peerId === peerId,
+          );
+
+          if (existingIndex === -1) {
+            return [...current, nextCursor];
+          }
+
+          const next = current.slice();
+          next[existingIndex] = nextCursor;
+          return next;
+        });
         return;
       }
 
@@ -2585,6 +2550,11 @@ function App() {
           setPendingCollaborationRequests((current) =>
             current.filter((request) => request.peerId !== payload.peerId),
           );
+          if (payload.kind === "peerDisconnected") {
+            setRemoteCursors((current) =>
+              current.filter((cursor) => cursor.peerId !== payload.peerId),
+            );
+          }
         }
         setCollaboration((state) => ({
           ...state,
@@ -2600,9 +2570,8 @@ function App() {
           `event_disconnected wasGuest=${wasGuest} currentStatus=${collaborationStateRef.current.status} message=${payload.message ?? "none"}`,
         );
         lastCollaborationFilesSignatureRef.current = "";
-        localElementLocksRef.current = {};
-        remoteElementLocksRef.current = {};
         setPendingCollaborationRequests([]);
+        setRemoteCursors([]);
         setCollaboration({
           status: "idle",
           message: payload.message ?? "Conexao encerrada.",
@@ -2659,9 +2628,26 @@ function App() {
     return () => {
       logCollaborationDebug("app_cleanup_stop_collaboration");
       clearCollaborationUpdate();
+      clearCollaborationCursorUpdate();
       void stopCollaborationSession();
     };
-  }, [clearCollaborationUpdate]);
+  }, [clearCollaborationCursorUpdate, clearCollaborationUpdate]);
+
+  useEffect(() => {
+    if (collaboration.status !== "hosting" && collaboration.status !== "connected") {
+      setRemoteCursors([]);
+      return;
+    }
+
+    const interval = window.setInterval(() => {
+      const now = Date.now();
+      setRemoteCursors((current) =>
+        current.filter((cursor) => now - cursor.updatedAt < REMOTE_CURSOR_TTL_MS),
+      );
+    }, 1_000);
+
+    return () => window.clearInterval(interval);
+  }, [collaboration.status]);
 
   const getAttachmentInsertPosition = useCallback(
     (size: { width: number; height: number }) => {
@@ -3021,6 +3007,55 @@ function App() {
     ],
   );
 
+  const getCanvasScenePoint = useCallback((clientX: number, clientY: number) => {
+    const host = canvasHostRef.current;
+    const appState = excalidrawApiRef.current?.getAppState() ?? appStateRef.current;
+
+    if (!host || !appState) {
+      return null;
+    }
+
+    const rect = host.getBoundingClientRect();
+    const zoom = getZoomValue(appState);
+
+    return {
+      x: (clientX - rect.left - Number(appState.scrollX || 0)) / zoom,
+      y: (clientY - rect.top - Number(appState.scrollY || 0)) / zoom,
+    };
+  }, []);
+
+  const handleCanvasPointerMoveCapture = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      const point = getCanvasScenePoint(event.clientX, event.clientY);
+
+      if (!point) {
+        return;
+      }
+
+      scheduleCollaborationCursorUpdate({
+        ...point,
+        visible: true,
+      });
+    },
+    [getCanvasScenePoint, scheduleCollaborationCursorUpdate],
+  );
+
+  const handleCanvasPointerLeaveCapture = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      const point = getCanvasScenePoint(event.clientX, event.clientY);
+
+      if (!point) {
+        return;
+      }
+
+      scheduleCollaborationCursorUpdate({
+        ...point,
+        visible: false,
+      });
+    },
+    [getCanvasScenePoint, scheduleCollaborationCursorUpdate],
+  );
+
   const handleCanvasFileDrag = useCallback(
     (event: React.DragEvent<HTMLDivElement>) => {
       if (!hasDraggedFiles(event)) {
@@ -3203,9 +3238,17 @@ function App() {
         const zoom = sceneViewport.zoom || 1;
         const deltaX = (moveEvent.clientX - lastX) / zoom;
         const deltaY = (moveEvent.clientY - lastY) / zoom;
+        const point = getCanvasScenePoint(moveEvent.clientX, moveEvent.clientY);
 
         lastX = moveEvent.clientX;
         lastY = moveEvent.clientY;
+
+        if (point) {
+          scheduleCollaborationCursorUpdate({
+            ...point,
+            visible: true,
+          });
+        }
 
         const nextAttachments = attachmentsRef.current.map((attachment) =>
           attachment.id === attachmentId
@@ -3219,6 +3262,7 @@ function App() {
 
         attachmentsRef.current = nextAttachments;
         setAttachments(nextAttachments);
+        scheduleCollaborationUpdate();
       };
 
       const handleEnd = () => {
@@ -3232,7 +3276,14 @@ function App() {
       window.addEventListener("pointerup", handleEnd);
       window.addEventListener("pointercancel", handleEnd);
     },
-    [handleAttachmentSelect, markAttachmentsChanged, sceneViewport.zoom],
+    [
+      getCanvasScenePoint,
+      handleAttachmentSelect,
+      markAttachmentsChanged,
+      sceneViewport.zoom,
+      scheduleCollaborationUpdate,
+      scheduleCollaborationCursorUpdate,
+    ],
   );
 
   const handleRename = useCallback(
@@ -4437,6 +4488,8 @@ function App() {
           onDragOverCapture={handleCanvasFileDrag}
           onDropCapture={handleCanvasFileDrop}
           onPointerDownCapture={handleCanvasPointerDownCapture}
+          onPointerLeave={handleCanvasPointerLeaveCapture}
+          onPointerMoveCapture={handleCanvasPointerMoveCapture}
           ref={canvasHostRef}
         >
           {activeProject ? (
@@ -4504,6 +4557,21 @@ function App() {
                       zoom={sceneViewport.zoom}
                     />
                   ))}
+              </div>
+              <div className="remote-cursor-layer" aria-hidden="true">
+                {remoteCursors.map((cursor) => (
+                  <div
+                    className="remote-cursor"
+                    key={cursor.peerId}
+                    style={{
+                      color: cursor.color,
+                      transform: `translate3d(${cursor.x * sceneViewport.zoom + sceneViewport.scrollX}px, ${cursor.y * sceneViewport.zoom + sceneViewport.scrollY}px, 0)`,
+                    }}
+                  >
+                    <MousePointer2 size={18} />
+                    <span style={{ backgroundColor: cursor.color }}>{cursor.label}</span>
+                  </div>
+                ))}
               </div>
             </>
           ) : (

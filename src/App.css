@@ -691,6 +691,48 @@ button {
   pointer-events: none;
 }
 
+.remote-cursor-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 9;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.remote-cursor {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 3px;
+  filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.32));
+  pointer-events: none;
+  transition: transform 55ms linear;
+  will-change: transform;
+}
+
+.remote-cursor svg {
+  flex: 0 0 auto;
+  fill: currentColor;
+  stroke: #ffffff;
+  stroke-width: 2.4;
+}
+
+.remote-cursor span {
+  max-width: 86px;
+  overflow: hidden;
+  border-radius: 5px;
+  color: #ffffff;
+  font-size: 10.5px;
+  font-weight: 800;
+  line-height: 15px;
+  padding: 1px 5px;
+  text-overflow: ellipsis;
+  transform: translate(1px, 12px);
+  white-space: nowrap;
+}
+
 .attachment-card {
   position: absolute;
   display: grid;

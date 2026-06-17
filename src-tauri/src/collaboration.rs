@@ -29,7 +29,7 @@ const MAX_ENCRYPTED_WIRE_MESSAGE_BYTES: usize = MAX_WIRE_MESSAGE_BYTES + 128;
 const MAX_COLLABORATION_PEERS: usize = 4;
 const JOIN_APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 const PEER_RATE_WINDOW: Duration = Duration::from_secs(1);
-const MAX_SCENE_UPDATES_PER_WINDOW: usize = 12;
+const MAX_SCENE_UPDATES_PER_WINDOW: usize = 30;
 
 #[derive(Default)]
 pub struct CollaborationManager {
@@ -91,6 +91,15 @@ enum WireMessage {
         author_id: String,
         revision: u64,
         payload: String,
+    },
+    CursorUpdate {
+        session_id: String,
+        canvas_id: String,
+        author_id: String,
+        revision: u64,
+        x: f64,
+        y: f64,
+        visible: bool,
     },
     Stop {
         reason: String,
@@ -517,6 +526,16 @@ pub fn send_collaboration_update(
     send_collaboration_update_inner(state.inner(), payload)
 }
 
+#[tauri::command]
+pub fn send_collaboration_cursor_update(
+    state: State<'_, CollaborationManager>,
+    x: f64,
+    y: f64,
+    visible: bool,
+) -> Result<(), String> {
+    send_collaboration_cursor_update_inner(state.inner(), x, y, visible)
+}
+
 fn send_collaboration_update_inner(
     manager: &CollaborationManager,
     payload: String,
@@ -547,15 +566,6 @@ fn send_collaboration_update_inner(
         return Err("Esta sessao esta em modo somente visualizacao.".to_string());
     }
 
-    append_debug_log(&format!(
-        "native send_update role={} session={} canvas={} peer={} {}",
-        runtime.role.as_str(),
-        runtime.session_id,
-        runtime.canvas_id,
-        runtime.peer_id,
-        payload_summary(&payload)
-    ));
-
     let message = WireMessage::SceneUpdate {
         session_id: runtime.session_id.clone(),
         canvas_id: runtime.canvas_id.clone(),
@@ -573,8 +583,6 @@ fn send_collaboration_update_inner(
             }
 
             if let Some(peers) = &runtime.peers {
-                let peer_count = peers.lock().ok().map(|peers| peers.len()).unwrap_or(0);
-                append_debug_log(&format!("native host_broadcast_queued peers={peer_count}"));
                 broadcast_to_peers(peers, &message, None);
             }
         }
@@ -587,7 +595,60 @@ fn send_collaboration_update_inner(
                 append_debug_log("native guest_send_queue_error reason=outbound_closed");
                 "Conexao com host encerrada.".to_string()
             })?;
-            append_debug_log("native guest_send_queued");
+        }
+    }
+
+    Ok(())
+}
+
+fn send_collaboration_cursor_update_inner(
+    manager: &CollaborationManager,
+    x: f64,
+    y: f64,
+    visible: bool,
+) -> Result<(), String> {
+    if !x.is_finite() || !y.is_finite() {
+        append_debug_log("native cursor_rejected reason=invalid_position");
+        return Err("Posicao de cursor invalida.".to_string());
+    }
+
+    let mut runtime = manager.runtime.lock().map_err(|error| error.to_string())?;
+    if runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.stop.load(Ordering::Relaxed))
+    {
+        append_debug_log("native cursor_rejected reason=runtime_stopped");
+        runtime.take();
+        return Err("Conexao de colaboracao encerrada.".to_string());
+    }
+
+    let Some(runtime) = runtime.as_ref() else {
+        return Ok(());
+    };
+
+    let message = WireMessage::CursorUpdate {
+        session_id: runtime.session_id.clone(),
+        canvas_id: runtime.canvas_id.clone(),
+        author_id: runtime.peer_id.clone(),
+        revision: now_millis(),
+        x,
+        y,
+        visible,
+    };
+
+    match runtime.role {
+        CollaborationRole::Host => {
+            if let Some(peers) = &runtime.peers {
+                broadcast_to_peers(peers, &message, None);
+            }
+        }
+        CollaborationRole::Guest => {
+            if let Some(outbound) = &runtime.outbound {
+                outbound.send(message).map_err(|_| {
+                    append_debug_log("native guest_cursor_queue_error reason=outbound_closed");
+                    "Conexao com host encerrada.".to_string()
+                })?;
+            }
         }
     }
 
@@ -998,10 +1059,7 @@ fn handle_host_peer<S: CollaborationEventSink>(
             Ok(peers) => peers,
             Err(_) => return,
         };
-        peers.insert(
-            peer_id.clone(),
-            PeerConnection { tx: tx.clone() },
-        );
+        peers.insert(peer_id.clone(), PeerConnection { tx: tx.clone() });
         peers.len()
     };
     let welcome_payload_summary = payload_summary(&payload);
@@ -1108,10 +1166,6 @@ fn handle_host_peer<S: CollaborationEventSink>(
                     continue;
                 }
 
-                append_debug_log(&format!(
-                    "native host_scene_update_received peer={peer_id} author={author_id} rev={revision} {}",
-                    payload_summary(&payload)
-                ));
                 if let Ok(mut latest) = session.latest_payload.lock() {
                     *latest = merge_payload_with_previous_files(&latest, &payload);
                 }
@@ -1135,6 +1189,41 @@ fn handle_host_peer<S: CollaborationEventSink>(
                         peer_id: Some(peer_id.clone()),
                         read_only: Some(false),
                         payload: Some(payload),
+                        peer_count: None,
+                        message: None,
+                    },
+                );
+            }
+            Ok(Some(WireMessage::CursorUpdate {
+                session_id,
+                canvas_id,
+                author_id,
+                revision,
+                x,
+                y,
+                visible,
+            })) if session_id == session.session_id && canvas_id == session.canvas_id => {
+                let message = WireMessage::CursorUpdate {
+                    session_id: session.session_id.clone(),
+                    canvas_id: session.canvas_id.clone(),
+                    author_id: author_id.clone(),
+                    revision,
+                    x,
+                    y,
+                    visible,
+                };
+                broadcast_to_peers(&session.peers, &message, Some(&peer_id));
+                emit_event(
+                    &event_sink,
+                    CollaborationEvent {
+                        kind: "cursorUpdate".to_string(),
+                        role: Some("host".to_string()),
+                        session_id: Some(session.session_id.clone()),
+                        canvas_id: Some(session.canvas_id.clone()),
+                        request_id: None,
+                        peer_id: Some(author_id),
+                        read_only: None,
+                        payload: Some(cursor_event_payload(x, y, visible, revision)),
                         peer_count: None,
                         message: None,
                     },
@@ -1198,10 +1287,15 @@ fn spawn_writer_thread(
             match rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(message) => {
                     let should_stop = matches!(message, WireMessage::Stop { .. });
-                    append_debug_log(&format!(
-                        "native writer_send {label} {}",
-                        wire_message_summary(&message)
-                    ));
+                    if !matches!(
+                        message,
+                        WireMessage::CursorUpdate { .. } | WireMessage::SceneUpdate { .. }
+                    ) {
+                        append_debug_log(&format!(
+                            "native writer_send {label} {}",
+                            wire_message_summary(&message)
+                        ));
+                    }
                     if let Err(error) = send_wire_message(&mut stream, &crypto, &message) {
                         append_debug_log(&format!(
                             "native writer_send_error {label} error={error}"
@@ -1260,10 +1354,6 @@ fn spawn_guest_reader<S: CollaborationEventSink>(
                     payload,
                     ..
                 })) if incoming_session == session_id && incoming_canvas == canvas_id => {
-                    append_debug_log(&format!(
-                        "native guest_scene_update_received session={session_id} canvas={canvas_id} {}",
-                        payload_summary(&payload)
-                    ));
                     emit_event(
                         &event_sink,
                         CollaborationEvent {
@@ -1275,6 +1365,31 @@ fn spawn_guest_reader<S: CollaborationEventSink>(
                             peer_id: None,
                             read_only: None,
                             payload: Some(payload),
+                            peer_count: None,
+                            message: None,
+                        },
+                    );
+                }
+                Ok(Some(WireMessage::CursorUpdate {
+                    session_id: incoming_session,
+                    canvas_id: incoming_canvas,
+                    author_id,
+                    revision,
+                    x,
+                    y,
+                    visible,
+                })) if incoming_session == session_id && incoming_canvas == canvas_id => {
+                    emit_event(
+                        &event_sink,
+                        CollaborationEvent {
+                            kind: "cursorUpdate".to_string(),
+                            role: Some("guest".to_string()),
+                            session_id: Some(session_id.clone()),
+                            canvas_id: Some(canvas_id.clone()),
+                            request_id: None,
+                            peer_id: Some(author_id),
+                            read_only: None,
+                            payload: Some(cursor_event_payload(x, y, visible, revision)),
                             peer_count: None,
                             message: None,
                         },
@@ -1496,10 +1611,12 @@ fn read_wire_message(
 
     let decrypted = decrypt_wire_payload(crypto, &data)?;
 
-    serde_json::from_slice(&decrypted).map(Some).map_err(|error| {
-        let prefix = String::from_utf8_lossy(&decrypted[..decrypted.len().min(32)]);
-        format!("{error}; prefix={prefix:?}; bytes={}", data.len())
-    })
+    serde_json::from_slice(&decrypted)
+        .map(Some)
+        .map_err(|error| {
+            let prefix = String::from_utf8_lossy(&decrypted[..decrypted.len().min(32)]);
+            format!("{error}; prefix={prefix:?}; bytes={}", data.len())
+        })
 }
 
 fn collaboration_crypto(session_id: &str, canvas_id: &str, token: &str) -> CollaborationCrypto {
@@ -1712,6 +1829,16 @@ fn payload_summary(payload: &str) -> String {
     format!("bytes={} elements={elements} files={files}", payload.len())
 }
 
+fn cursor_event_payload(x: f64, y: f64, visible: bool, revision: u64) -> String {
+    serde_json::json!({
+        "x": x,
+        "y": y,
+        "visible": visible,
+        "revision": revision,
+    })
+    .to_string()
+}
+
 fn wire_message_summary(message: &WireMessage) -> String {
     match message {
         WireMessage::Hello { client_id, .. } => {
@@ -1736,6 +1863,17 @@ fn wire_message_summary(message: &WireMessage) -> String {
         } => format!(
             "sceneUpdate session={session_id} canvas={canvas_id} author={author_id} rev={revision} {}",
             payload_summary(payload)
+        ),
+        WireMessage::CursorUpdate {
+            session_id,
+            canvas_id,
+            author_id,
+            revision,
+            x,
+            y,
+            visible,
+        } => format!(
+            "cursorUpdate session={session_id} canvas={canvas_id} author={author_id} rev={revision} x={x:.1} y={y:.1} visible={visible}"
         ),
         WireMessage::Stop { reason } => format!("stop reason={reason}"),
         WireMessage::Error { message } => format!("error message={message}"),
@@ -1846,7 +1984,8 @@ mod tests {
                 BufReader::new(stream.try_clone().expect("server should clone stream"));
             let mut writer = stream;
 
-            match read_wire_message(&mut reader, &server_crypto).expect("server should read message")
+            match read_wire_message(&mut reader, &server_crypto)
+                .expect("server should read message")
             {
                 Some(WireMessage::SceneUpdate {
                     session_id,
@@ -2091,32 +2230,105 @@ mod tests {
 
         panic!("guest runtime did not clear after host stop");
     }
+
+    #[test]
+    fn collaboration_runtime_broadcasts_remote_cursors() {
+        let host_manager = CollaborationManager::default();
+        let guest_manager = CollaborationManager::default();
+        let host_events = TestEventSink::default();
+        let guest_events = TestEventSink::default();
+
+        let host_info = start_collaboration_session_inner(
+            host_events.clone(),
+            &host_manager,
+            "canvas-a".to_string(),
+            "initial-scene".to_string(),
+            CollaborationStartOptions {
+                require_approval: false,
+                default_read_only: false,
+            },
+        )
+        .expect("host should start collaboration");
+        let mut invite = decode_invite(host_info.code.as_deref().expect("host should expose code"))
+            .expect("host code should decode");
+        invite
+            .endpoints
+            .retain(|endpoint| endpoint.starts_with("127.0.0.1:"));
+        assert_eq!(invite.endpoints.len(), 1);
+        let loopback_code = encode_invite(&invite).expect("loopback invite should encode");
+
+        let guest_info =
+            join_collaboration_session_inner(guest_events.clone(), &guest_manager, loopback_code)
+                .expect("guest should join host");
+
+        host_events.wait_for("host peer connected", |event| {
+            event.kind == "peerConnected" && event.peer_count == Some(1)
+        });
+
+        send_collaboration_cursor_update_inner(&guest_manager, 42.5, 84.25, true)
+            .expect("guest should send cursor");
+        let guest_cursor = host_events.wait_for("host cursor update from guest", |event| {
+            event.kind == "cursorUpdate"
+                && event.peer_id.as_deref() == Some(guest_info.peer_id.as_str())
+        });
+        let guest_payload: serde_json::Value = serde_json::from_str(
+            guest_cursor
+                .payload
+                .as_deref()
+                .expect("guest cursor should include payload"),
+        )
+        .expect("guest cursor payload should be json");
+        assert_eq!(guest_payload["x"].as_f64(), Some(42.5));
+        assert_eq!(guest_payload["y"].as_f64(), Some(84.25));
+        assert_eq!(guest_payload["visible"].as_bool(), Some(true));
+
+        send_collaboration_cursor_update_inner(&host_manager, 12.0, 24.0, false)
+            .expect("host should send cursor");
+        let host_cursor = guest_events.wait_for("guest cursor update from host", |event| {
+            event.kind == "cursorUpdate"
+                && event.peer_id.as_deref() == Some(host_info.peer_id.as_str())
+        });
+        let host_payload: serde_json::Value = serde_json::from_str(
+            host_cursor
+                .payload
+                .as_deref()
+                .expect("host cursor should include payload"),
+        )
+        .expect("host cursor payload should be json");
+        assert_eq!(host_payload["x"].as_f64(), Some(12.0));
+        assert_eq!(host_payload["y"].as_f64(), Some(24.0));
+        assert_eq!(host_payload["visible"].as_bool(), Some(false));
+
+        host_manager.stop("done");
+    }
 }
 
 fn emit_event<S: CollaborationEventSink>(event_sink: &S, event: CollaborationEvent) {
-    let payload = event
-        .payload
-        .as_ref()
-        .map(|payload| payload_summary(payload))
-        .unwrap_or_else(|| "payload=none".to_string());
-    append_debug_log(&format!(
-        "native emit_event kind={} role={} session={} canvas={} request={} peer={} read_only={} peers={} message={} {}",
-        event.kind,
-        event.role.as_deref().unwrap_or("none"),
-        event.session_id.as_deref().unwrap_or("none"),
-        event.canvas_id.as_deref().unwrap_or("none"),
-        event.request_id.as_deref().unwrap_or("none"),
-        event.peer_id.as_deref().unwrap_or("none"),
-        event
-            .read_only
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_string()),
-        event
-            .peer_count
-            .map(|count| count.to_string())
-            .unwrap_or_else(|| "none".to_string()),
-        event.message.as_deref().unwrap_or("none"),
-        payload
-    ));
+    if event.kind != "cursorUpdate" && event.kind != "sceneUpdate" {
+        let payload = event
+            .payload
+            .as_ref()
+            .map(|payload| payload_summary(payload))
+            .unwrap_or_else(|| "payload=none".to_string());
+        append_debug_log(&format!(
+            "native emit_event kind={} role={} session={} canvas={} request={} peer={} read_only={} peers={} message={} {}",
+            event.kind,
+            event.role.as_deref().unwrap_or("none"),
+            event.session_id.as_deref().unwrap_or("none"),
+            event.canvas_id.as_deref().unwrap_or("none"),
+            event.request_id.as_deref().unwrap_or("none"),
+            event.peer_id.as_deref().unwrap_or("none"),
+            event
+                .read_only
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            event
+                .peer_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            event.message.as_deref().unwrap_or("none"),
+            payload
+        ));
+    }
     event_sink.emit_collaboration_event(event);
 }

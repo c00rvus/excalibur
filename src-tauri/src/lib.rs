@@ -1339,6 +1339,7 @@ pub fn run() {
             collaboration::respond_collaboration_join_request,
             collaboration::stop_collaboration_session,
             collaboration::send_collaboration_update,
+            collaboration::send_collaboration_cursor_update,
             collaboration::get_collaboration_status,
             collaboration::write_collaboration_debug_log,
             collaboration::get_collaboration_debug_log_path,

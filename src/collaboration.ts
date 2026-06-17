@@ -22,6 +22,7 @@ export type CollaborationEvent = {
     | "peerConnected"
     | "peerDisconnected"
     | "sceneUpdate"
+    | "cursorUpdate"
     | "disconnected"
     | "error";
   role?: CollaborationRole | null;
@@ -94,6 +95,18 @@ export async function sendCollaborationUpdate(payload: string) {
   }
 
   return invoke<void>("send_collaboration_update", { payload });
+}
+
+export async function sendCollaborationCursorUpdate(
+  x: number,
+  y: number,
+  visible: boolean,
+) {
+  if (!isTauri()) {
+    return;
+  }
+
+  return invoke<void>("send_collaboration_cursor_update", { x, y, visible });
 }
 
 export async function getCollaborationStatus() {

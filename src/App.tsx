@@ -32,6 +32,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openPath, openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
+  Check,
   ChevronDown,
   Clock3,
   Copy,
@@ -115,7 +116,25 @@ import {
 type ExportFormat = "png" | "jpeg";
 type ExportScope = "canvas" | "area";
 type ExportDestination = "project" | "path";
+type ClipboardCopyResult = "rich" | "image" | "text";
 type AppTheme = "light" | "dark";
+type ClipboardRichPart =
+  | {
+      kind: "text";
+      text: string;
+      x: number;
+      y: number;
+      index: number;
+    }
+  | {
+      kind: "image";
+      dataURL: DataURL;
+      width: number;
+      height: number;
+      x: number;
+      y: number;
+      index: number;
+    };
 type PendingAttachmentSource =
   | {
       type: "path";
@@ -480,6 +499,160 @@ function getCleanAppState(appState: AppState): Partial<AppState> {
   };
 }
 
+function getSelectedCanvasElements(
+  elements: readonly ExcalidrawElement[],
+  appState: AppState,
+) {
+  return getCanvasElementsBySelectedIds(elements, appState.selectedElementIds ?? {});
+}
+
+function getCanvasElementsBySelectedIds(
+  elements: readonly ExcalidrawElement[],
+  selectedElementIds: Readonly<Record<string, boolean>>,
+) {
+  const selectedIds = new Set(
+    Object.entries(selectedElementIds)
+      .filter(([, selected]) => selected)
+      .map(([id]) => id),
+  );
+
+  for (const element of elements) {
+    if (!selectedIds.has(element.id)) {
+      continue;
+    }
+
+    const boundElements = (
+      element as ExcalidrawElement & {
+        boundElements?: readonly { id?: string | null }[] | null;
+      }
+    ).boundElements;
+
+    for (const boundElement of boundElements ?? []) {
+      if (boundElement.id) {
+        selectedIds.add(boundElement.id);
+      }
+    }
+  }
+
+  return elements.filter((element) => !element.isDeleted && selectedIds.has(element.id));
+}
+
+function getElementClipboardPosition(element: ExcalidrawElement) {
+  const [x, y] = getCommonBounds([element]);
+
+  return { x, y };
+}
+
+function getElementText(element: ExcalidrawElement) {
+  const textElement = element as ExcalidrawElement & {
+    rawText?: string;
+    text?: string;
+  };
+
+  return (textElement.rawText ?? textElement.text ?? "").trim();
+}
+
+function getImageElementFileId(element: ExcalidrawElement) {
+  const imageElement = element as ExcalidrawElement & {
+    fileId?: FileId | null;
+  };
+
+  return imageElement.fileId ?? null;
+}
+
+function getOrderedClipboardParts(
+  elements: readonly ExcalidrawElement[],
+  files: BinaryFiles,
+): ClipboardRichPart[] {
+  return elements
+    .map((element, index): ClipboardRichPart | null => {
+      const position = getElementClipboardPosition(element);
+
+      if (element.type === "text") {
+        const text = getElementText(element);
+
+        return text
+          ? {
+              kind: "text",
+              text,
+              x: position.x,
+              y: position.y,
+              index,
+            }
+          : null;
+      }
+
+      if (element.type === "image") {
+        const fileId = getImageElementFileId(element);
+        const file = fileId ? files[fileId] : null;
+
+        return file
+          ? {
+              kind: "image",
+              dataURL: file.dataURL,
+              width: Math.max(1, Math.round(element.width)),
+              height: Math.max(1, Math.round(element.height)),
+              x: position.x,
+              y: position.y,
+              index,
+            }
+          : null;
+      }
+
+      return null;
+    })
+    .filter((part): part is ClipboardRichPart => Boolean(part))
+    .sort((left, right) => {
+      const verticalDelta = left.y - right.y;
+
+      if (Math.abs(verticalDelta) > 4) {
+        return verticalDelta;
+      }
+
+      const horizontalDelta = left.x - right.x;
+
+      if (Math.abs(horizontalDelta) > 4) {
+        return horizontalDelta;
+      }
+
+      return left.index - right.index;
+    });
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function getClipboardPlainText(parts: readonly ClipboardRichPart[]) {
+  return parts
+    .filter((part) => part.kind === "text")
+    .map((part) => part.text)
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function getClipboardHtml(parts: readonly ClipboardRichPart[]) {
+  if (!parts.length) {
+    return "";
+  }
+
+  const blocks = parts
+    .map((part) => {
+      if (part.kind === "text") {
+        return `<div style="white-space:pre-wrap;margin:0 0 12px 0;">${escapeHtml(part.text)}</div>`;
+      }
+
+      return `<img src="${escapeHtml(part.dataURL)}" width="${part.width}" height="${part.height}" style="display:block;max-width:100%;height:auto;margin:0 0 12px 0;" />`;
+    })
+    .join("");
+
+  return `<!doctype html><html><body><div>${blocks}</div></body></html>`;
+}
+
 function formatRelativeTime(value: number) {
   const elapsedSeconds = Math.max(1, Math.floor((Date.now() - value) / 1000));
 
@@ -841,6 +1014,51 @@ async function cropCanvasToBlob({
     outputCanvas.width = 1;
     outputCanvas.height = 1;
   }
+}
+
+async function writeSelectionToClipboard(
+  options: {
+    html?: string;
+    imageBlob?: Blob | null;
+    plainText: string;
+  },
+): Promise<ClipboardCopyResult> {
+  const trimmedHtml = options.html?.trim() ?? "";
+  const trimmedText = options.plainText.trim();
+
+  if (
+    trimmedHtml &&
+    navigator.clipboard?.write &&
+    typeof ClipboardItem !== "undefined"
+  ) {
+    await navigator.clipboard.write([
+      new ClipboardItem({
+        "text/html": new Blob([trimmedHtml], { type: "text/html" }),
+        "text/plain": new Blob([trimmedText], { type: "text/plain" }),
+      }),
+    ]);
+    return "rich";
+  }
+
+  if (
+    options.imageBlob &&
+    navigator.clipboard?.write &&
+    typeof ClipboardItem !== "undefined"
+  ) {
+    await navigator.clipboard.write([
+      new ClipboardItem({
+        "image/png": options.imageBlob,
+      }),
+    ]);
+    return "image";
+  }
+
+  if (trimmedText && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(trimmedText);
+    return "text";
+  }
+
+  throw new Error("clipboard write is unavailable");
 }
 
 async function exportAreaToBlob({
@@ -1398,10 +1616,14 @@ function App() {
   const collaborationCursorUpdateTimerRef = useRef<number | null>(null);
   const remoteApplyTimerRef = useRef<number | null>(null);
   const themeApplyTimerRef = useRef<number | null>(null);
+  const copyFeedbackTimerRef = useRef<number | null>(null);
+  const themeBackgroundSyncUntilRef = useRef(0);
   const activeProjectRef = useRef<ProjectMetadata | null>(null);
   const previousThemeRef = useRef<AppTheme>(getStoredTheme());
   const foldersRef = useRef<ProjectFolder[]>([]);
   const projectsRef = useRef<ProjectMetadata[]>([]);
+  const lastSelectedElementIdsRef = useRef<Readonly<Record<string, boolean>>>({});
+  const lastSelectedElementsRef = useRef<readonly ExcalidrawElement[]>([]);
   const isDirtyRef = useRef(false);
   const lastKnownSignatureRef = useRef("");
   const lastSavedSignatureRef = useRef("");
@@ -1425,6 +1647,8 @@ function App() {
     useState<CanvasInitialData | null>(null);
   const [attachments, setAttachments] = useState<CanvasAttachment[]>([]);
   const [selectedAttachmentId, setSelectedAttachmentId] = useState<string | null>(null);
+  const [selectedElementCount, setSelectedElementCount] = useState(0);
+  const [copyFeedback, setCopyFeedback] = useState<ClipboardCopyResult | null>(null);
   const [sceneViewport, setSceneViewport] = useState<SceneViewport>({
     scrollX: 0,
     scrollY: 0,
@@ -1555,20 +1779,22 @@ function App() {
 
       const apply = () => {
         const currentAppState = api.getAppState();
+        const viewBackgroundColor = options.forceBackground
+          ? (theme === "dark" ? lastDarkBg : lastLightBg)
+          : getThemeAwareCanvasBackground(
+              currentAppState.viewBackgroundColor,
+              theme,
+              lastLightBg,
+              lastDarkBg,
+              options.previousTheme,
+            );
         const themeAppState = {
           ...currentAppState,
           theme: getExcalidrawTheme(theme),
-          viewBackgroundColor: options.forceBackground
-            ? (theme === "dark" ? lastDarkBg : lastLightBg)
-            : getThemeAwareCanvasBackground(
-                currentAppState.viewBackgroundColor,
-                theme,
-                lastLightBg,
-                lastDarkBg,
-                options.previousTheme,
-              ),
+          viewBackgroundColor,
         } as AppState;
 
+        themeBackgroundSyncUntilRef.current = Date.now() + 750;
         api.updateScene({
           elements: api.getSceneElementsIncludingDeleted(),
           appState: themeAppState,
@@ -2225,6 +2451,9 @@ function App() {
         attachmentsRef.current = restoredAttachments;
         setAttachments(restoredAttachments);
         setSelectedAttachmentId(null);
+        lastSelectedElementIdsRef.current = {};
+        lastSelectedElementsRef.current = [];
+        setSelectedElementCount(0);
         syncSceneViewport(appStateRef.current);
 
         if (appStateRef.current) {
@@ -2333,6 +2562,9 @@ function App() {
     attachmentsRef.current = [];
     setAttachments([]);
     setSelectedAttachmentId(null);
+    lastSelectedElementIdsRef.current = {};
+    lastSelectedElementsRef.current = [];
+    setSelectedElementCount(0);
     syncSceneViewport(appStateRef.current);
 
     if (appStateRef.current) {
@@ -2384,6 +2616,9 @@ function App() {
       setCanvasInitialData(null);
       setAttachments([]);
       setSelectedAttachmentId(null);
+      lastSelectedElementIdsRef.current = {};
+      lastSelectedElementsRef.current = [];
+      setSelectedElementCount(0);
       setExportedPath(null);
       setIsDirty(false);
       setStatus(nextStatus);
@@ -2423,6 +2658,10 @@ function App() {
         window.clearTimeout(themeApplyTimerRef.current);
         themeApplyTimerRef.current = null;
       }
+      if (copyFeedbackTimerRef.current) {
+        window.clearTimeout(copyFeedbackTimerRef.current);
+        copyFeedbackTimerRef.current = null;
+      }
       if (remoteApplyTimerRef.current) {
         window.clearTimeout(remoteApplyTimerRef.current);
         remoteApplyTimerRef.current = null;
@@ -2442,11 +2681,33 @@ function App() {
       files: BinaryFiles,
     ) => {
       const previousElements = elementsRef.current;
+      const targetTheme = getExcalidrawTheme(appTheme);
+      const viewBackgroundColor = getThemeAwareCanvasBackground(
+        appState.viewBackgroundColor,
+        appTheme,
+        lastLightBg,
+        lastDarkBg,
+        previousThemeRef.current,
+      );
+      const backgroundWasCorrected =
+        normalizeColor(viewBackgroundColor) !== normalizeColor(appState.viewBackgroundColor);
       const themedAppState = {
         ...appState,
-        theme: getExcalidrawTheme(appTheme),
+        theme: targetTheme,
+        viewBackgroundColor,
       } as AppState;
       const currentCollaboration = collaborationStateRef.current;
+      const selectedCanvasElements = getSelectedCanvasElements(
+        elements,
+        themedAppState,
+      );
+      const selectedCanvasElementCount = selectedCanvasElements.length;
+
+      if (selectedCanvasElementCount) {
+        lastSelectedElementIdsRef.current = themedAppState.selectedElementIds ?? {};
+        lastSelectedElementsRef.current = selectedCanvasElements;
+      }
+      setSelectedElementCount(selectedCanvasElementCount);
 
       if (
         currentCollaboration.readOnly &&
@@ -2484,8 +2745,15 @@ function App() {
       filesRef.current = files;
       syncSceneViewport(themedAppState);
 
-      if (appState.theme === getExcalidrawTheme(appTheme) && appState.viewBackgroundColor) {
-        const currentBg = appState.viewBackgroundColor;
+      const isThemeBackgroundSyncing = Date.now() < themeBackgroundSyncUntilRef.current;
+
+      if (
+        !isThemeBackgroundSyncing &&
+        !backgroundWasCorrected &&
+        appState.theme === targetTheme &&
+        themedAppState.viewBackgroundColor
+      ) {
+        const currentBg = themedAppState.viewBackgroundColor;
         if (appTheme === "light" && currentBg !== lastLightBg) {
           setLastLightBg(currentBg);
           localStorage.setItem(LAST_LIGHT_BG_KEY, currentBg);
@@ -2496,7 +2764,8 @@ function App() {
       }
 
       if (
-        appState.theme !== getExcalidrawTheme(appTheme)
+        appState.theme !== targetTheme ||
+        backgroundWasCorrected
       ) {
         applyCanvasTheme(appTheme, undefined, { forceBackground: true });
       }
@@ -2665,6 +2934,9 @@ function App() {
         attachmentsRef.current = restoredAttachments;
         setAttachments(restoredAttachments);
         setSelectedAttachmentId(null);
+        lastSelectedElementIdsRef.current = {};
+        lastSelectedElementsRef.current = [];
+        setSelectedElementCount(0);
         syncSceneViewport(appStateRef.current);
 
         const currentAppState = appStateRef.current ?? canvasAppState;
@@ -3689,6 +3961,9 @@ function App() {
 
   const handleAttachmentSelect = useCallback((attachmentId: string) => {
     setSelectedAttachmentId(attachmentId);
+    lastSelectedElementIdsRef.current = {};
+    lastSelectedElementsRef.current = [];
+    setSelectedElementCount(0);
 
     const api = excalidrawApiRef.current;
     if (!api) {
@@ -3885,6 +4160,9 @@ function App() {
         setCanvasInitialData(null);
         setAttachments([]);
         setSelectedAttachmentId(null);
+        lastSelectedElementIdsRef.current = {};
+        lastSelectedElementsRef.current = [];
+        setSelectedElementCount(0);
         setActiveFolderId(getProjectFolderId(project));
         setExportedPath(null);
         setIsDirty(false);
@@ -4314,8 +4592,96 @@ function App() {
   }, [activeFolderId, openProject]);
 
   const toggleTheme = useCallback(() => {
+    themeBackgroundSyncUntilRef.current = Date.now() + 750;
     setAppTheme((current) => (current === "dark" ? "light" : "dark"));
   }, []);
+
+  const handleCopySelection = useCallback(async () => {
+    const api = excalidrawApiRef.current;
+    const appState = api?.getAppState() ?? appStateRef.current;
+    const sceneElements = api?.getSceneElements() ?? elementsRef.current;
+
+    if (!activeProjectRef.current || !appState) {
+      setStatus("Selecione um canvas");
+      return;
+    }
+
+    const currentSelectedElements = getSelectedCanvasElements(sceneElements, appState);
+    let selectedElements =
+      lastSelectedElementsRef.current.length > currentSelectedElements.length
+        ? lastSelectedElementsRef.current
+        : currentSelectedElements;
+
+    if (!selectedElements.length && lastSelectedElementIdsRef.current) {
+      selectedElements = getCanvasElementsBySelectedIds(
+        sceneElements,
+        lastSelectedElementIdsRef.current,
+      );
+    }
+
+    if (!selectedElements.length) {
+      setStatus("Selecione elementos");
+      return;
+    }
+
+    try {
+      if (copyFeedbackTimerRef.current) {
+        window.clearTimeout(copyFeedbackTimerRef.current);
+        copyFeedbackTimerRef.current = null;
+      }
+      setCopyFeedback(null);
+      setStatus("Copiando selecao");
+
+      const orderedClipboardParts = getOrderedClipboardParts(
+        selectedElements,
+        filesRef.current,
+      );
+      const plainText = getClipboardPlainText(orderedClipboardParts);
+      const hasText = orderedClipboardParts.some((part) => part.kind === "text");
+      const hasImage = orderedClipboardParts.some((part) => part.kind === "image");
+      const shouldCopyRichContent = hasText && hasImage;
+      const shouldCopyImageBlob = !shouldCopyRichContent && !hasText;
+      const backgroundColor =
+        appState.viewBackgroundColor || getCanvasBackground(appTheme);
+      const imageBlob = shouldCopyImageBlob
+        ? await exportToBlob({
+            elements: selectedElements,
+            appState: {
+              ...getCleanAppState(appState),
+              exportBackground: true,
+              viewBackgroundColor: backgroundColor,
+            },
+            files: filesRef.current,
+            mimeType: "image/png",
+            exportPadding: 16,
+          })
+        : null;
+      const result = await writeSelectionToClipboard({
+        html: shouldCopyRichContent
+          ? getClipboardHtml(orderedClipboardParts)
+          : undefined,
+        imageBlob,
+        plainText,
+      });
+
+      setCopyFeedback(result);
+      copyFeedbackTimerRef.current = window.setTimeout(() => {
+        setCopyFeedback(null);
+        copyFeedbackTimerRef.current = null;
+      }, 1300);
+      setStatus(
+        result === "rich"
+          ? "Selecao copiada com texto e imagens"
+          : result === "image"
+            ? "Selecao copiada como imagem"
+            : "Texto copiado",
+      );
+    } catch (error) {
+      console.error(error);
+      setCopyFeedback(null);
+      setStatus("Falha ao copiar selecao");
+    }
+  }, [appTheme]);
 
   const buildExportPayload = useCallback(
     async (
@@ -4843,6 +5209,10 @@ function App() {
     Boolean(collaboration.readOnly);
   const canSaveProject =
     Boolean(activeProject) && (!isGuestCollaboration || canGuestSaveCopy);
+  const canCopySelection =
+    Boolean(activeProject) &&
+    selectedElementCount > 0 &&
+    (!isGuestCollaboration || canGuestSaveCopy);
   const canConfirmGuestSave =
     guestSaveFolderMode === "new"
       ? Boolean(guestSaveFolderName.trim())
@@ -5187,6 +5557,25 @@ function App() {
             >
               <Save size={16} />
               <span>{isGuestCollaboration ? "Salvar copia" : "Salvar"}</span>
+            </button>
+            <button
+              className={`toolbar-button copy-action ${
+                copyFeedback ? "copy-action-done" : ""
+              }`}
+              disabled={!canCopySelection}
+              onClick={() => void handleCopySelection()}
+              onPointerDown={(event) => {
+                event.preventDefault();
+              }}
+              title={
+                selectedElementCount > 0
+                  ? "Copiar selecao para a area de transferencia"
+                  : "Selecione elementos para copiar"
+              }
+              type="button"
+            >
+              {copyFeedback ? <Check size={16} /> : <Copy size={16} />}
+              <span>{copyFeedback ? "Copiado" : "Copiar"}</span>
             </button>
             <button
               className="toolbar-button"

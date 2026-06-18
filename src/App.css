@@ -553,6 +553,48 @@ button {
   background: var(--control-hover);
 }
 
+.copy-action {
+  min-width: 90px;
+}
+
+.copy-action-done,
+.topbar-actions .copy-action-done:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
+  animation: copy-confirm 520ms ease;
+}
+
+.copy-action-done svg {
+  animation: copy-confirm-icon 520ms ease;
+}
+
+@keyframes copy-confirm {
+  0% {
+    transform: scale(0.96);
+  }
+  55% {
+    transform: scale(1.04);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes copy-confirm-icon {
+  0% {
+    opacity: 0;
+    transform: scale(0.72);
+  }
+  60% {
+    opacity: 1;
+    transform: scale(1.18);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
 .collaboration-trigger.is-live {
   color: var(--accent);
 }

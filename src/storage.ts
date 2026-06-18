@@ -19,7 +19,7 @@ export type ExportedFile = {
   path: string;
 };
 
-export type AttachmentKind = "text" | "pdf" | "image" | "video" | "file";
+export type AttachmentKind = "text" | "pdf" | "image" | "video" | "audio" | "file";
 
 export type AttachmentAsset = {
   name: string;

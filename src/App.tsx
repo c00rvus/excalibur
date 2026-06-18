@@ -37,6 +37,7 @@ import {
   Clock3,
   Copy,
   ExternalLink,
+  AudioLines,
   FileImage,
   Folder,
   FolderOpen,
@@ -46,13 +47,16 @@ import {
   Moon,
   MousePointer2,
   Paperclip,
+  Pause,
   Pencil,
+  Play,
   Plus,
   RotateCcw,
   Save,
   Search,
   Settings,
   ShieldCheck,
+  Square,
   Sun,
   Trash2,
   Users,
@@ -135,6 +139,14 @@ type ClipboardRichPart =
       y: number;
       index: number;
     };
+type ExcaliburAttachmentElementData = {
+  attachmentId?: string;
+  durationMs?: number;
+  kind?: AttachmentAsset["kind"];
+  name?: string;
+  pageIndex?: number;
+  sourcePath?: string;
+};
 type PendingAttachmentSource =
   | {
       type: "path";
@@ -147,6 +159,17 @@ type PendingAttachmentSource =
       bytes: number[];
       name: string;
     };
+
+type AudioRecordingStatus = "idle" | "recording" | "paused" | "ready" | "saving";
+
+type PendingAudioRecording = {
+  blob: Blob;
+  createdAt: number;
+  durationMs: number;
+  fileName: string;
+  mimeType: string;
+  size: number;
+};
 
 type PreviewConversionState = {
   fileName: string;
@@ -560,12 +583,33 @@ function getImageElementFileId(element: ExcalidrawElement) {
   return imageElement.fileId ?? null;
 }
 
+function getExcaliburAttachmentElementData(
+  element: ExcalidrawElement,
+): ExcaliburAttachmentElementData | null {
+  const elementWithCustomData = element as ExcalidrawElement & {
+    customData?: {
+      excaliburAttachment?: ExcaliburAttachmentElementData;
+    } | null;
+  };
+  const attachmentData = elementWithCustomData.customData?.excaliburAttachment;
+
+  return attachmentData && typeof attachmentData === "object" ? attachmentData : null;
+}
+
+function isNativeAudioElement(element: ExcalidrawElement) {
+  return getExcaliburAttachmentElementData(element)?.kind === "audio";
+}
+
 function getOrderedClipboardParts(
   elements: readonly ExcalidrawElement[],
   files: BinaryFiles,
 ): ClipboardRichPart[] {
   return elements
     .map((element, index): ClipboardRichPart | null => {
+      if (isNativeAudioElement(element)) {
+        return null;
+      }
+
       const position = getElementClipboardPosition(element);
 
       if (element.type === "text") {
@@ -836,6 +880,64 @@ function sanitizeFilePart(value: string) {
 async function blobToBytes(blob: Blob) {
   const buffer = await blob.arrayBuffer();
   return Array.from(new Uint8Array(buffer));
+}
+
+function getSupportedAudioMimeType() {
+  if (typeof MediaRecorder === "undefined" || !MediaRecorder.isTypeSupported) {
+    return "";
+  }
+
+  return (
+    [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/ogg",
+      "audio/mp4",
+    ].find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) ?? ""
+  );
+}
+
+function getAudioRecordingExtension(mimeType: string) {
+  const normalized = mimeType.toLowerCase();
+
+  if (normalized.includes("ogg")) {
+    return "ogg";
+  }
+
+  if (normalized.includes("mp4")) {
+    return "m4a";
+  }
+
+  if (normalized.includes("wav")) {
+    return "wav";
+  }
+
+  return "weba";
+}
+
+function getAudioRecordingFileName(mimeType: string) {
+  const extension = getAudioRecordingExtension(mimeType);
+
+  return `audio-${new Date().toISOString().replace(/[:.]/g, "-")}.${extension}`;
+}
+
+function formatAudioDuration(milliseconds: number) {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+  const minutes = Math.floor(totalSeconds / 60)
+    .toString()
+    .padStart(2, "0");
+  const seconds = (totalSeconds % 60).toString().padStart(2, "0");
+
+  return `${minutes}:${seconds}`;
+}
+
+function getAudioContextConstructor() {
+  const windowWithWebkit = window as Window & {
+    webkitAudioContext?: typeof AudioContext;
+  };
+
+  return window.AudioContext || windowWithWebkit.webkitAudioContext;
 }
 
 function getExportExtension(format: ExportFormat) {
@@ -1398,6 +1500,8 @@ function preserveLocalViewport(
 
 const NATIVE_PREVIEW_MAX_WIDTH = 640;
 const NATIVE_PREVIEW_PAGE_GAP = 28;
+const NATIVE_AUDIO_WIDTH = 148;
+const NATIVE_AUDIO_HEIGHT = 58;
 
 function getNativePreviewLayout(result: NativePreviewResult) {
   const sizes = result.pages.map((page) => {
@@ -1490,10 +1594,72 @@ function createNativePreviewImageElement({
   } as ExcalidrawElement;
 }
 
+function createNativeAudioElement({
+  attachmentId,
+  attachmentName,
+  durationMs,
+  height,
+  sourcePath,
+  width,
+  x,
+  y,
+}: {
+  attachmentId: string;
+  attachmentName: string;
+  durationMs?: number;
+  height: number;
+  sourcePath: string;
+  width: number;
+  x: number;
+  y: number;
+}) {
+  const now = Date.now();
+
+  return {
+    id: crypto.randomUUID(),
+    type: "audio",
+    x,
+    y,
+    width,
+    height,
+    angle: 0,
+    strokeColor: "transparent",
+    backgroundColor: "transparent",
+    fillStyle: "solid",
+    strokeWidth: 1,
+    strokeStyle: "solid",
+    roughness: 0,
+    opacity: 100,
+    groupIds: [],
+    frameId: null,
+    index: null,
+    roundness: null,
+    seed: randomElementInteger(),
+    version: 1,
+    versionNonce: randomElementInteger(),
+    isDeleted: false,
+    boundElements: null,
+    updated: now,
+    link: null,
+    locked: false,
+    customData: {
+      excaliburAttachment: {
+        attachmentId,
+        durationMs,
+        kind: "audio",
+        name: attachmentName,
+        pageIndex: 0,
+        sourcePath,
+      },
+    },
+  } as ExcalidrawElement;
+}
+
 function isPointInsideElement(
   element: ExcalidrawElement,
   sceneX: number,
   sceneY: number,
+  hitPadding = 0,
 ) {
   const centerX = element.x + element.width / 2;
   const centerY = element.y + element.height / 2;
@@ -1503,42 +1669,57 @@ function isPointInsideElement(
   const sin = Math.sin(-element.angle);
   const localX = deltaX * cos - deltaY * sin + element.width / 2;
   const localY = deltaX * sin + deltaY * cos + element.height / 2;
+  const minX = Math.min(0, element.width) - hitPadding;
+  const maxX = Math.max(0, element.width) + hitPadding;
+  const minY = Math.min(0, element.height) - hitPadding;
+  const maxY = Math.max(0, element.height) + hitPadding;
 
   return (
-    localX >= 0 &&
-    localX <= element.width &&
-    localY >= 0 &&
-    localY <= element.height
+    localX >= minX &&
+    localX <= maxX &&
+    localY >= minY &&
+    localY <= maxY
   );
 }
 
-function getNativeVideoAttachmentAtPoint(
+function getNativePlayableAttachmentAtPoint(
   attachments: CanvasAttachment[],
   elements: readonly ExcalidrawElement[],
   sceneX: number,
   sceneY: number,
+  options: {
+    hitPadding?: number;
+    kind?: CanvasAttachment["kind"];
+  } = {},
 ) {
-  const nativeVideoAttachments = new Map<string, CanvasAttachment>();
+  const nativePlayableAttachments = new Map<string, CanvasAttachment>();
 
   attachments.forEach((attachment) => {
-    if (attachment.displayMode !== "native" || attachment.kind !== "video") {
+    if (
+      attachment.displayMode !== "native" ||
+      (attachment.kind !== "video" && attachment.kind !== "audio")
+    ) {
+      return;
+    }
+
+    if (options.kind && attachment.kind !== options.kind) {
       return;
     }
 
     attachment.nativeElementIds?.forEach((elementId) => {
-      nativeVideoAttachments.set(elementId, attachment);
+      nativePlayableAttachments.set(elementId, attachment);
     });
   });
 
   for (let index = elements.length - 1; index >= 0; index -= 1) {
     const element = elements[index];
-    const attachment = nativeVideoAttachments.get(element.id);
+    const attachment = nativePlayableAttachments.get(element.id);
 
     if (!attachment || element.isDeleted) {
       continue;
     }
 
-    if (isPointInsideElement(element, sceneX, sceneY)) {
+    if (isPointInsideElement(element, sceneX, sceneY, options.hitPadding ?? 0)) {
       return attachment;
     }
   }
@@ -1617,6 +1798,20 @@ function App() {
   const remoteApplyTimerRef = useRef<number | null>(null);
   const themeApplyTimerRef = useRef<number | null>(null);
   const copyFeedbackTimerRef = useRef<number | null>(null);
+  const audioAnimationFrameRef = useRef<number | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioElapsedTimerRef = useRef<number | null>(null);
+  const audioRecordingElapsedBeforePauseRef = useRef(0);
+  const audioRecordingFinalDurationRef = useRef(0);
+  const audioRecordingStartedAtRef = useRef(0);
+  const audioAnalyserRef = useRef<AnalyserNode | null>(null);
+  const audioToolActionRef = useRef<() => void>(() => undefined);
+  const audioToolActivationPendingRef = useRef(false);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const discardAudioOnStopRef = useRef(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const pendingAudioRecordingRef = useRef<PendingAudioRecording | null>(null);
   const themeBackgroundSyncUntilRef = useRef(0);
   const activeProjectRef = useRef<ProjectMetadata | null>(null);
   const previousThemeRef = useRef<AppTheme>(getStoredTheme());
@@ -1714,6 +1909,17 @@ function App() {
   const [videoPlayerAttachment, setVideoPlayerAttachment] =
     useState<CanvasAttachment | null>(null);
   const [videoPlaybackError, setVideoPlaybackError] = useState("");
+  const [audioPlayerAttachment, setAudioPlayerAttachment] =
+    useState<CanvasAttachment | null>(null);
+  const [audioPlaybackError, setAudioPlaybackError] = useState("");
+  const [isAudioRecorderOpen, setIsAudioRecorderOpen] = useState(false);
+  const [audioRecordingStatus, setAudioRecordingStatus] =
+    useState<AudioRecordingStatus>("idle");
+  const [audioRecorderError, setAudioRecorderError] = useState("");
+  const [audioElapsedMs, setAudioElapsedMs] = useState(0);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [pendingAudioRecording, setPendingAudioRecording] =
+    useState<PendingAudioRecording | null>(null);
 
   const [draggedProjectId, setDraggedProjectId] = useState<string | null>(null);
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
@@ -1823,6 +2029,10 @@ function App() {
   useEffect(() => {
     activeProjectRef.current = activeProject;
   }, [activeProject]);
+
+  useEffect(() => {
+    pendingAudioRecordingRef.current = pendingAudioRecording;
+  }, [pendingAudioRecording]);
 
   useEffect(() => {
     projectsRef.current = projects;
@@ -2681,27 +2891,70 @@ function App() {
       files: BinaryFiles,
     ) => {
       const previousElements = elementsRef.current;
+      const audioToolRequested = appState.activeTool.type === "audio";
+      const appStateForTheme = audioToolRequested
+        ? ({
+            ...appState,
+            activeTool: {
+              ...appState.activeTool,
+              type: "selection",
+              customType: null,
+            },
+          } as AppState)
+        : appState;
       const targetTheme = getExcalidrawTheme(appTheme);
       const viewBackgroundColor = getThemeAwareCanvasBackground(
-        appState.viewBackgroundColor,
+        appStateForTheme.viewBackgroundColor,
         appTheme,
         lastLightBg,
         lastDarkBg,
         previousThemeRef.current,
       );
       const backgroundWasCorrected =
-        normalizeColor(viewBackgroundColor) !== normalizeColor(appState.viewBackgroundColor);
+        normalizeColor(viewBackgroundColor) !== normalizeColor(appStateForTheme.viewBackgroundColor);
       const themedAppState = {
-        ...appState,
+        ...appStateForTheme,
         theme: targetTheme,
         viewBackgroundColor,
       } as AppState;
+
+      if (audioToolRequested) {
+        excalidrawApiRef.current?.setActiveTool({ type: "selection" });
+
+        if (!audioToolActivationPendingRef.current) {
+          audioToolActivationPendingRef.current = true;
+          window.setTimeout(() => {
+            audioToolActivationPendingRef.current = false;
+            audioToolActionRef.current();
+          }, 0);
+        }
+      }
+
       const currentCollaboration = collaborationStateRef.current;
       const selectedCanvasElements = getSelectedCanvasElements(
         elements,
         themedAppState,
       );
       const selectedCanvasElementCount = selectedCanvasElements.length;
+      const visibleElementIds = new Set(
+        elements
+          .filter((element) => !element.isDeleted)
+          .map((element) => element.id),
+      );
+      const nextCanvasAttachments = attachmentsRef.current.filter((attachment) => {
+        if (attachment.displayMode !== "native" || !attachment.nativeElementIds?.length) {
+          return true;
+        }
+
+        return attachment.nativeElementIds.some((elementId) =>
+          visibleElementIds.has(elementId),
+        );
+      });
+
+      if (nextCanvasAttachments.length !== attachmentsRef.current.length) {
+        attachmentsRef.current = nextCanvasAttachments;
+        setAttachments(nextCanvasAttachments);
+      }
 
       if (selectedCanvasElementCount) {
         lastSelectedElementIdsRef.current = themedAppState.selectedElementIds ?? {};
@@ -2750,7 +3003,7 @@ function App() {
       if (
         !isThemeBackgroundSyncing &&
         !backgroundWasCorrected &&
-        appState.theme === targetTheme &&
+        appStateForTheme.theme === targetTheme &&
         themedAppState.viewBackgroundColor
       ) {
         const currentBg = themedAppState.viewBackgroundColor;
@@ -2764,7 +3017,7 @@ function App() {
       }
 
       if (
-        appState.theme !== targetTheme ||
+        appStateForTheme.theme !== targetTheme ||
         backgroundWasCorrected
       ) {
         applyCanvasTheme(appTheme, undefined, { forceBackground: true });
@@ -2774,7 +3027,7 @@ function App() {
         const remoteSignature = getProjectSignature(
           elements,
           themedAppState,
-          attachmentsRef.current,
+          nextCanvasAttachments,
         );
         lastKnownSignatureRef.current = remoteSignature;
         return;
@@ -2787,7 +3040,7 @@ function App() {
       const signature = getProjectSignature(
         elements,
         themedAppState,
-        attachmentsRef.current,
+        nextCanvasAttachments,
       );
 
       if (signature === lastKnownSignatureRef.current) {
@@ -2838,6 +3091,23 @@ function App() {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [videoPlayerAttachment]);
+
+  useEffect(() => {
+    if (!audioPlayerAttachment) {
+      return;
+    }
+
+    setAudioPlaybackError("");
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setAudioPlayerAttachment(null);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [audioPlayerAttachment]);
 
   const handleManualSave = useCallback(async () => {
     if (isGuestCollaborationState(collaborationStateRef.current)) {
@@ -3488,6 +3758,463 @@ function App() {
     [scheduleAutoSave, scheduleCollaborationUpdate],
   );
 
+  const insertNativeAudioAttachment = useCallback(
+    (
+      asset: AttachmentAsset,
+      options: {
+        createdAt?: number;
+        durationMs?: number;
+        position?: CanvasPoint;
+      } = {},
+    ) => {
+      const api = excalidrawApiRef.current;
+
+      if (!api) {
+        throw new Error("Nao foi possivel inserir o audio no canvas.");
+      }
+
+      const attachmentId = crypto.randomUUID();
+      const size = { width: NATIVE_AUDIO_WIDTH, height: NATIVE_AUDIO_HEIGHT };
+      const position = options.position
+        ? {
+            x: options.position.x - size.width / 2,
+            y: options.position.y - size.height / 2,
+          }
+        : getAttachmentInsertPosition(size);
+      const element = createNativeAudioElement({
+        attachmentId,
+        attachmentName: asset.name,
+        durationMs: options.durationMs,
+        height: size.height,
+        sourcePath: asset.path,
+        width: size.width,
+        ...position,
+      });
+      const nextFiles = filesRef.current;
+      const nextElements: ExcalidrawElement[] = [
+        ...elementsRef.current,
+        element,
+      ];
+      const nextAppState = {
+        ...api.getAppState(),
+        selectedElementIds: { [element.id]: true },
+      } as AppState;
+
+      api.updateScene({
+        elements: nextElements,
+        appState: nextAppState,
+        captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+      });
+      api.refresh();
+
+      elementsRef.current = nextElements;
+      appStateRef.current = nextAppState;
+      filesRef.current = nextFiles;
+      syncSceneViewport(nextAppState);
+
+      const attachment: CanvasAttachment = {
+        ...asset,
+        id: attachmentId,
+        displayMode: "native",
+        ...position,
+        ...size,
+        createdAt: options.createdAt ?? Date.now(),
+        nativeElementIds: [element.id],
+        nativePageCount: 1,
+        nativeSourcePageCount: 1,
+      };
+
+      markAttachmentsChanged([...attachmentsRef.current, attachment], "Audio inserido");
+    },
+    [getAttachmentInsertPosition, markAttachmentsChanged, syncSceneViewport],
+  );
+
+  const stopAudioElapsedTimer = useCallback(() => {
+    if (audioElapsedTimerRef.current) {
+      window.clearInterval(audioElapsedTimerRef.current);
+      audioElapsedTimerRef.current = null;
+    }
+  }, []);
+
+  const getCurrentAudioElapsedMs = useCallback(() => {
+    const recorder = mediaRecorderRef.current;
+    const startedAt = audioRecordingStartedAtRef.current;
+    const elapsedBeforePause = audioRecordingElapsedBeforePauseRef.current;
+
+    if (recorder?.state === "recording" && startedAt) {
+      return elapsedBeforePause + Date.now() - startedAt;
+    }
+
+    return elapsedBeforePause;
+  }, []);
+
+  const startAudioElapsedTimer = useCallback(() => {
+    stopAudioElapsedTimer();
+    audioElapsedTimerRef.current = window.setInterval(() => {
+      setAudioElapsedMs(getCurrentAudioElapsedMs());
+    }, 250);
+  }, [getCurrentAudioElapsedMs, stopAudioElapsedTimer]);
+
+  const stopAudioCaptureResources = useCallback(() => {
+    stopAudioElapsedTimer();
+
+    if (audioAnimationFrameRef.current) {
+      window.cancelAnimationFrame(audioAnimationFrameRef.current);
+      audioAnimationFrameRef.current = null;
+    }
+
+    audioAnalyserRef.current = null;
+    setAudioLevel(0);
+
+    if (audioContextRef.current) {
+      void audioContextRef.current.close().catch(() => undefined);
+      audioContextRef.current = null;
+    }
+
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+  }, [stopAudioElapsedTimer]);
+
+  const startAudioLevelMeter = useCallback((stream: MediaStream) => {
+    const AudioContextConstructor = getAudioContextConstructor();
+
+    if (!AudioContextConstructor) {
+      return;
+    }
+
+    try {
+      const audioContext = new AudioContextConstructor();
+      const analyser = audioContext.createAnalyser();
+      const source = audioContext.createMediaStreamSource(stream);
+
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.72;
+      const data = new Uint8Array(analyser.fftSize);
+
+      source.connect(analyser);
+      audioContextRef.current = audioContext;
+      audioAnalyserRef.current = analyser;
+
+      const tick = () => {
+        const currentAnalyser = audioAnalyserRef.current;
+
+        if (!currentAnalyser) {
+          return;
+        }
+
+        currentAnalyser.getByteTimeDomainData(data);
+
+        let sum = 0;
+        for (const value of data) {
+          const normalized = (value - 128) / 128;
+          sum += normalized * normalized;
+        }
+
+        const rms = Math.sqrt(sum / data.length);
+        setAudioLevel(Math.min(1, rms * 5));
+        audioAnimationFrameRef.current = window.requestAnimationFrame(tick);
+      };
+
+      tick();
+    } catch {
+      setAudioLevel(0);
+    }
+  }, []);
+
+  const startAudioRecording = useCallback(async () => {
+    const project = activeProjectRef.current;
+
+    if (!project) {
+      setStatus("Selecione um canvas");
+      return;
+    }
+
+    if (isGuestCollaborationState(collaborationStateRef.current)) {
+      setStatus("Visitante nao grava audio");
+      return;
+    }
+
+    if (pendingAudioRecordingRef.current) {
+      setIsAudioRecorderOpen(true);
+      setStatus("Posicione ou descarte o audio atual");
+      return;
+    }
+
+    if (typeof MediaRecorder === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      setIsAudioRecorderOpen(true);
+      setAudioRecorderError("Gravacao de audio indisponivel neste sistema.");
+      return;
+    }
+
+    discardAudioOnStopRef.current = false;
+    setAudioRecorderError("");
+    setIsAudioRecorderOpen(true);
+    setStatus("Solicitando microfone");
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = getSupportedAudioMimeType();
+      const recorder = new MediaRecorder(
+        stream,
+        mimeType ? { mimeType } : undefined,
+      );
+
+      mediaStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+      audioChunksRef.current = [];
+      audioRecordingElapsedBeforePauseRef.current = 0;
+      audioRecordingFinalDurationRef.current = 0;
+      audioRecordingStartedAtRef.current = Date.now();
+      setPendingAudioRecording(null);
+      setAudioElapsedMs(0);
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onerror = () => {
+        setAudioRecorderError("Nao foi possivel continuar a gravacao.");
+        setStatus("Erro ao gravar audio");
+      };
+
+      recorder.onstop = () => {
+        const chunks = audioChunksRef.current;
+        const finalMimeType = recorder.mimeType || mimeType || "audio/webm";
+        const durationMs =
+          audioRecordingFinalDurationRef.current || getCurrentAudioElapsedMs();
+
+        mediaRecorderRef.current = null;
+        audioChunksRef.current = [];
+        stopAudioCaptureResources();
+
+        if (discardAudioOnStopRef.current) {
+          discardAudioOnStopRef.current = false;
+          setAudioRecordingStatus("idle");
+          setAudioElapsedMs(0);
+          setStatus("Gravacao descartada");
+          return;
+        }
+
+        const blob = new Blob(chunks, { type: finalMimeType });
+        if (!blob.size) {
+          setAudioRecordingStatus("idle");
+          setAudioRecorderError("A gravacao ficou vazia.");
+          setStatus("Audio vazio");
+          return;
+        }
+
+        const pending: PendingAudioRecording = {
+          blob,
+          createdAt: Date.now(),
+          durationMs,
+          fileName: getAudioRecordingFileName(finalMimeType),
+          mimeType: finalMimeType,
+          size: blob.size,
+        };
+
+        pendingAudioRecordingRef.current = pending;
+        setPendingAudioRecording(pending);
+        setAudioElapsedMs(durationMs);
+        setAudioRecordingStatus("ready");
+        setStatus("Clique no canvas para posicionar o audio");
+      };
+
+      recorder.start(1_000);
+      setAudioRecordingStatus("recording");
+      setStatus("Gravando audio");
+      startAudioElapsedTimer();
+      startAudioLevelMeter(stream);
+    } catch {
+      stopAudioCaptureResources();
+      mediaRecorderRef.current = null;
+      setAudioRecordingStatus("idle");
+      setAudioRecorderError("Nao foi possivel acessar o microfone.");
+      setStatus("Microfone indisponivel");
+    }
+  }, [
+    getCurrentAudioElapsedMs,
+    startAudioElapsedTimer,
+    startAudioLevelMeter,
+    stopAudioCaptureResources,
+  ]);
+
+  const pauseAudioRecording = useCallback(() => {
+    const recorder = mediaRecorderRef.current;
+
+    if (!recorder || recorder.state !== "recording") {
+      return;
+    }
+
+    audioRecordingElapsedBeforePauseRef.current = getCurrentAudioElapsedMs();
+    recorder.pause();
+    setAudioElapsedMs(audioRecordingElapsedBeforePauseRef.current);
+    setAudioRecordingStatus("paused");
+    stopAudioElapsedTimer();
+    setAudioLevel(0);
+    setStatus("Gravacao pausada");
+  }, [getCurrentAudioElapsedMs, stopAudioElapsedTimer]);
+
+  const resumeAudioRecording = useCallback(() => {
+    const recorder = mediaRecorderRef.current;
+
+    if (!recorder || recorder.state !== "paused") {
+      return;
+    }
+
+    audioRecordingStartedAtRef.current = Date.now();
+    recorder.resume();
+    setAudioRecordingStatus("recording");
+    startAudioElapsedTimer();
+    setStatus("Gravando audio");
+  }, [startAudioElapsedTimer]);
+
+  const stopAudioRecording = useCallback(() => {
+    const recorder = mediaRecorderRef.current;
+
+    if (!recorder || recorder.state === "inactive") {
+      return;
+    }
+
+    audioRecordingFinalDurationRef.current = getCurrentAudioElapsedMs();
+    setAudioElapsedMs(audioRecordingFinalDurationRef.current);
+    setAudioRecordingStatus("saving");
+    setStatus("Finalizando audio");
+    stopAudioElapsedTimer();
+    recorder.stop();
+  }, [getCurrentAudioElapsedMs, stopAudioElapsedTimer]);
+
+  const cancelAudioRecording = useCallback(() => {
+    const recorder = mediaRecorderRef.current;
+
+    if (recorder && recorder.state !== "inactive") {
+      discardAudioOnStopRef.current = true;
+      recorder.stop();
+    } else {
+      stopAudioCaptureResources();
+      mediaRecorderRef.current = null;
+      audioChunksRef.current = [];
+      setAudioRecordingStatus("idle");
+      setAudioElapsedMs(0);
+      setAudioLevel(0);
+      setStatus("Gravacao descartada");
+    }
+
+    pendingAudioRecordingRef.current = null;
+    setPendingAudioRecording(null);
+    setAudioRecorderError("");
+    setIsAudioRecorderOpen(false);
+  }, [stopAudioCaptureResources]);
+
+  const placePendingAudioRecording = useCallback(
+    async (point: CanvasPoint) => {
+      const project = activeProjectRef.current;
+      const pending = pendingAudioRecordingRef.current;
+
+      if (!project || !pending) {
+        return;
+      }
+
+      if (isGuestCollaborationState(collaborationStateRef.current)) {
+        setStatus("Visitante nao grava audio");
+        return;
+      }
+
+      clearAutoSave();
+      setAudioRecordingStatus("saving");
+      setStatus("Salvando audio");
+
+      try {
+        if (isDirtyRef.current) {
+          await persistProject(project);
+        }
+
+        const bytes = await blobToBytes(pending.blob);
+        const storedAsset = await attachFileBytesToProject(
+          project.id,
+          pending.fileName,
+          bytes,
+        );
+        const asset: AttachmentAsset = {
+          ...storedAsset,
+          extension: getExtensionFromPath(pending.fileName),
+          kind: "audio",
+          mimeType: pending.mimeType || storedAsset.mimeType,
+          name: pending.fileName,
+          size: pending.size,
+        };
+
+        pendingAudioRecordingRef.current = null;
+        setPendingAudioRecording(null);
+        setAudioRecordingStatus("idle");
+        setAudioElapsedMs(0);
+        setAudioRecorderError("");
+        setIsAudioRecorderOpen(false);
+        insertNativeAudioAttachment(asset, {
+          createdAt: pending.createdAt,
+          durationMs: pending.durationMs,
+          position: point,
+        });
+      } catch (error) {
+        console.error("Failed to place audio recording", error);
+        setAudioRecordingStatus("ready");
+        setStatus("Nao foi possivel salvar o audio");
+      }
+    },
+    [clearAutoSave, insertNativeAudioAttachment, persistProject],
+  );
+
+  const handleAudioToolClick = useCallback(() => {
+    const canRecordAudio =
+      Boolean(activeProject) &&
+      !(
+        collaboration.role === "guest" &&
+        collaboration.status === "connected"
+      );
+
+    if (!canRecordAudio) {
+      setStatus("Abra um canvas local para gravar audio");
+      return;
+    }
+
+    if (audioRecordingStatus === "recording" || audioRecordingStatus === "paused") {
+      setIsAudioRecorderOpen(true);
+      return;
+    }
+
+    if (pendingAudioRecordingRef.current || audioRecordingStatus === "ready") {
+      setIsAudioRecorderOpen(true);
+      setStatus("Clique no canvas para posicionar o audio");
+      return;
+    }
+
+    setIsAudioRecorderOpen(true);
+  }, [activeProject, audioRecordingStatus, collaboration.role, collaboration.status]);
+
+  useEffect(() => {
+    audioToolActionRef.current = handleAudioToolClick;
+  }, [handleAudioToolClick]);
+
+  useEffect(() => {
+    return () => {
+      discardAudioOnStopRef.current = true;
+      const recorder = mediaRecorderRef.current;
+
+      if (recorder && recorder.state !== "inactive") {
+        try {
+          recorder.stop();
+        } catch {
+          // The recorder can already be inactive during app shutdown.
+        }
+      }
+
+      stopAudioCaptureResources();
+    };
+  }, [stopAudioCaptureResources]);
+
   const removeAttachmentById = useCallback(
     async (attachmentId: string) => {
       if (collaborationStateRef.current.readOnly) {
@@ -3686,6 +4413,14 @@ function App() {
             "avi",
             "mkv",
             "wmv",
+            "mp3",
+            "wav",
+            "ogg",
+            "oga",
+            "weba",
+            "m4a",
+            "aac",
+            "flac",
           ],
         },
       ],
@@ -3738,6 +4473,12 @@ function App() {
             : await attachFileBytesToProject(project.id, source.fileName, source.bytes);
 
         setPendingAttachment(null);
+
+        if (displayMode === "preview" && asset.kind === "audio") {
+          insertNativeAudioAttachment(asset);
+          setPreviewConversion(null);
+          return;
+        }
 
         if (displayMode === "preview" && canRenderNativeAttachmentPreview(asset)) {
           const handleProgress = (progress: NativePreviewProgress) => {
@@ -3794,6 +4535,7 @@ function App() {
     [
       clearAutoSave,
       getAttachmentInsertPosition,
+      insertNativeAudioAttachment,
       insertNativeAttachmentPreview,
       markAttachmentsChanged,
       pendingAttachment,
@@ -3941,11 +4683,12 @@ function App() {
         return;
       }
 
-      const attachment = getNativeVideoAttachmentAtPoint(
+      const attachment = getNativePlayableAttachmentAtPoint(
         attachmentsRef.current,
         elementsRef.current,
         point.x,
         point.y,
+        { hitPadding: 8 },
       );
 
       if (!attachment) {
@@ -3954,6 +4697,11 @@ function App() {
 
       event.preventDefault();
       event.stopPropagation();
+      if (attachment.kind === "audio") {
+        setAudioPlayerAttachment(attachment);
+        return;
+      }
+
       setVideoPlayerAttachment(attachment);
     },
     [getCanvasScenePoint],
@@ -3989,6 +4737,36 @@ function App() {
 
   const handleCanvasPointerDownCapture = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
+      if (pendingAudioRecordingRef.current) {
+        if (
+          event.target instanceof Element &&
+          event.target.closest(".audio-recorder-panel")
+        ) {
+          return;
+        }
+
+        if (
+          event.target instanceof Element &&
+          event.target.closest(".attachment-card")
+        ) {
+          setStatus("Clique em uma area vazia do canvas para posicionar o audio");
+          return;
+        }
+
+        const point = getCanvasScenePoint(event.clientX, event.clientY);
+
+        if (!point) {
+          setStatus("Clique no canvas para posicionar o audio");
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.nativeEvent.stopImmediatePropagation();
+        void placePendingAudioRecording(point);
+        return;
+      }
+
       if (
         event.target instanceof Element &&
         event.target.closest(".attachment-card")
@@ -3998,7 +4776,7 @@ function App() {
 
       setSelectedAttachmentId(null);
     },
-    [],
+    [getCanvasScenePoint, placePendingAudioRecording],
   );
 
   const handleAttachmentDragStart = useCallback(
@@ -4624,6 +5402,15 @@ function App() {
       return;
     }
 
+    const copyableSelectedElements = selectedElements.filter(
+      (element) => !isNativeAudioElement(element),
+    );
+
+    if (!copyableSelectedElements.length) {
+      setStatus("Selecao sem conteudo copiavel");
+      return;
+    }
+
     try {
       if (copyFeedbackTimerRef.current) {
         window.clearTimeout(copyFeedbackTimerRef.current);
@@ -4633,7 +5420,7 @@ function App() {
       setStatus("Copiando selecao");
 
       const orderedClipboardParts = getOrderedClipboardParts(
-        selectedElements,
+        copyableSelectedElements,
         filesRef.current,
       );
       const plainText = getClipboardPlainText(orderedClipboardParts);
@@ -4645,7 +5432,7 @@ function App() {
         appState.viewBackgroundColor || getCanvasBackground(appTheme);
       const imageBlob = shouldCopyImageBlob
         ? await exportToBlob({
-            elements: selectedElements,
+            elements: copyableSelectedElements,
             appState: {
               ...getCleanAppState(appState),
               exportBackground: true,
@@ -5197,6 +5984,9 @@ function App() {
   const videoPlayerSource = videoPlayerAttachment
     ? getAttachmentAssetUrl(videoPlayerAttachment.path)
     : "";
+  const audioPlayerSource = audioPlayerAttachment
+    ? getAttachmentAssetUrl(audioPlayerAttachment.path)
+    : "";
   const isCollaborationActive =
     collaboration.status === "hosting" || collaboration.status === "connected";
   const isGuestCollaboration =
@@ -5221,6 +6011,38 @@ function App() {
     collaboration.status === "starting" ||
     collaboration.status === "joining" ||
     collaboration.status === "stopping";
+  const isAudioPlacementPending = Boolean(pendingAudioRecording);
+  const isAudioRecorderVisible =
+    isAudioRecorderOpen ||
+    audioRecordingStatus !== "idle" ||
+    Boolean(pendingAudioRecording);
+  const audioDurationLabel = formatAudioDuration(
+    pendingAudioRecording?.durationMs ?? audioElapsedMs,
+  );
+  const audioRecorderTitle =
+    audioRecordingStatus === "recording"
+      ? "Gravando audio"
+      : audioRecordingStatus === "paused"
+        ? "Audio pausado"
+        : audioRecordingStatus === "saving"
+          ? "Processando audio"
+          : pendingAudioRecording
+            ? "Audio pronto"
+            : "Gravar audio";
+  const audioRecorderHint =
+    pendingAudioRecording || audioRecordingStatus === "ready"
+      ? "Clique em uma area vazia do canvas para posicionar."
+      : audioRecorderError || "Use o microfone padrao do sistema.";
+  const audioVisualizerBars = Array.from({ length: 28 }, (_, index) => {
+    const phase = ((index * 7) % 11) / 10;
+    const baseHeight = audioRecordingStatus === "recording" ? 2 : 2;
+    const dynamicHeight =
+      audioRecordingStatus === "recording"
+        ? Math.round(audioLevel * (4 + phase * 7))
+        : 0;
+
+    return Math.max(2, baseHeight + dynamicHeight);
+  });
 
   return (
     <main
@@ -5720,7 +6542,7 @@ function App() {
         </header>
 
         <div
-          className="canvas-host"
+          className={`canvas-host ${isAudioPlacementPending ? "is-placing-audio" : ""}`}
           onDoubleClickCapture={handleCanvasDoubleClick}
           onDragEnterCapture={handleCanvasFileDrag}
           onDragOverCapture={handleCanvasFileDrag}
@@ -5770,12 +6592,146 @@ function App() {
                     toggleTheme: false,
                   },
                   tools: {
+                    audio: true,
                     image: true,
-                  },
+                  } as { image: boolean } & Record<string, boolean>,
                 }}
               >
                 <ExcaliburMainMenu />
               </Excalidraw>
+              {isAudioRecorderVisible ? (
+                <section
+                  aria-label="Gravador de audio"
+                  className={`audio-recorder-panel audio-recorder-${audioRecordingStatus}`}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  role="dialog"
+                >
+                  <header className="audio-recorder-header">
+                    <div className="audio-recorder-title">
+                      <AudioLines size={17} />
+                      <strong>{audioRecorderTitle}</strong>
+                    </div>
+                    {!pendingAudioRecording && audioRecordingStatus !== "saving" ? (
+                      <button
+                        className="audio-recorder-close"
+                        onClick={() => {
+                          if (
+                            audioRecordingStatus === "recording" ||
+                            audioRecordingStatus === "paused"
+                          ) {
+                            cancelAudioRecording();
+                            return;
+                          }
+
+                          setIsAudioRecorderOpen(false);
+                        }}
+                        title={
+                          audioRecordingStatus === "recording" ||
+                          audioRecordingStatus === "paused"
+                            ? "Descartar gravacao"
+                            : "Ocultar gravador"
+                        }
+                        type="button"
+                      >
+                        <X size={14} />
+                      </button>
+                    ) : null}
+                  </header>
+
+                  <div className="audio-recorder-hint">
+                    {pendingAudioRecording
+                      ? `${audioRecorderHint} ${bytesToLabel(pendingAudioRecording.size)}`
+                      : audioRecorderHint}
+                  </div>
+
+                  <div className="audio-recorder-meter" aria-hidden="true">
+                    {audioVisualizerBars.map((height, index) => (
+                      <span
+                        key={`audio-bar-${index}`}
+                        style={{ height: `${height}px` }}
+                      />
+                    ))}
+                  </div>
+
+                  <div className="audio-recorder-time">
+                    <span>{audioDurationLabel}</span>
+                  </div>
+
+                  {pendingAudioRecording || audioRecordingStatus === "ready" ? (
+                    <div className="audio-recorder-placement">
+                      <span>{audioRecorderHint}</span>
+                      <button
+                        className="audio-recorder-secondary"
+                        onClick={cancelAudioRecording}
+                        type="button"
+                      >
+                        Descartar
+                      </button>
+                    </div>
+                  ) : null}
+
+                  {audioRecorderError && audioRecordingStatus === "idle" ? (
+                    <div className="audio-recorder-error">
+                      <span>{audioRecorderError}</span>
+                      <button
+                        className="audio-recorder-secondary"
+                        onClick={() => void startAudioRecording()}
+                        type="button"
+                      >
+                        Tentar novamente
+                      </button>
+                    </div>
+                  ) : null}
+
+                  {audioRecordingStatus === "idle" &&
+                  !pendingAudioRecording &&
+                  !audioRecorderError ? (
+                    <div className="audio-recorder-actions">
+                      <button
+                        className="audio-recorder-primary"
+                        onClick={() => void startAudioRecording()}
+                        type="button"
+                      >
+                        <AudioLines size={14} />
+                        <span>Gravar</span>
+                      </button>
+                    </div>
+                  ) : null}
+
+                  {audioRecordingStatus === "recording" ||
+                  audioRecordingStatus === "paused" ? (
+                    <div className="audio-recorder-actions">
+                      {audioRecordingStatus === "recording" ? (
+                        <button
+                          className="audio-recorder-secondary"
+                          onClick={pauseAudioRecording}
+                          type="button"
+                        >
+                          <Pause size={14} />
+                          <span>Pausar</span>
+                        </button>
+                      ) : (
+                        <button
+                          className="audio-recorder-secondary"
+                          onClick={resumeAudioRecording}
+                          type="button"
+                        >
+                          <Play size={14} />
+                          <span>Continuar</span>
+                        </button>
+                      )}
+                      <button
+                        className="audio-recorder-primary"
+                        onClick={stopAudioRecording}
+                        type="button"
+                      >
+                        <Square size={13} />
+                        <span>Stop</span>
+                      </button>
+                    </div>
+                  ) : null}
+                </section>
+              ) : null}
               <div className="attachment-layer" aria-label="Anexos do canvas">
                 {attachments
                   .filter((attachment) => attachment.displayMode !== "native")
@@ -6438,6 +7394,67 @@ function App() {
                 className="toolbar-button"
                 onClick={() => {
                   void handleOpenAttachment(videoPlayerAttachment);
+                }}
+                type="button"
+              >
+                <ExternalLink size={16} />
+                <span>Abrir no Windows</span>
+              </button>
+            </footer>
+          </section>
+        </div>
+      ) : null}
+
+      {audioPlayerAttachment ? (
+        <div
+          className="video-player-backdrop"
+          onMouseDown={() => setAudioPlayerAttachment(null)}
+        >
+          <section
+            aria-label="Reproduzir audio"
+            aria-modal="true"
+            className="video-player-panel audio-player-panel"
+            onMouseDown={(event) => event.stopPropagation()}
+            role="dialog"
+          >
+            <header className="video-player-header">
+              <div>
+                <strong>{audioPlayerAttachment.name}</strong>
+                <span>{audioPlayerAttachment.extension.toUpperCase() || "AUDIO"}</span>
+              </div>
+              <button
+                className="icon-button"
+                onClick={() => setAudioPlayerAttachment(null)}
+                title="Fechar"
+                type="button"
+              >
+                <X size={17} />
+              </button>
+            </header>
+            <div className="audio-player-body">
+              <AudioLines size={34} />
+              <audio
+                className="audio-player-media"
+                controls
+                key={audioPlayerAttachment.path}
+                onCanPlay={() => setAudioPlaybackError("")}
+                onError={() => {
+                  setAudioPlaybackError(
+                    "Nao foi possivel reproduzir este audio no app.",
+                  );
+                }}
+                preload="metadata"
+                src={audioPlayerSource}
+              />
+            </div>
+            <footer className="video-player-actions">
+              {audioPlaybackError ? (
+                <span className="video-player-error">{audioPlaybackError}</span>
+              ) : null}
+              <button
+                className="toolbar-button"
+                onClick={() => {
+                  void handleOpenAttachment(audioPlayerAttachment);
                 }}
                 type="button"
               >

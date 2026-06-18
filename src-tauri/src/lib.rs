@@ -569,12 +569,20 @@ fn is_video_extension(extension: &str) -> bool {
     )
 }
 
+fn is_audio_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "mp3" | "wav" | "ogg" | "oga" | "weba" | "m4a" | "aac" | "flac"
+    )
+}
+
 fn attachment_kind(extension: &str) -> &'static str {
     match extension {
         value if is_text_extension(value) => "text",
         "pdf" => "pdf",
         value if is_image_extension(value) => "image",
         value if is_video_extension(value) => "video",
+        value if is_audio_extension(value) => "audio",
         _ => "file",
     }
 }
@@ -597,6 +605,13 @@ fn attachment_mime_type(extension: &str) -> &'static str {
         "avi" => "video/x-msvideo",
         "mkv" => "video/x-matroska",
         "wmv" => "video/x-ms-wmv",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" | "oga" => "audio/ogg",
+        "weba" => "audio/webm",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
         _ => "application/octet-stream",
     }
 }
@@ -605,6 +620,7 @@ fn is_supported_attachment(extension: &str) -> bool {
     is_text_extension(extension)
         || is_image_extension(extension)
         || is_video_extension(extension)
+        || is_audio_extension(extension)
         || extension == "pdf"
 }
 

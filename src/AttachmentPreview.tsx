@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent } from "react";
 import * as pdfjsLib from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
-import { File, FileImage, FileText, FileVideo, Trash2 } from "lucide-react";
+import { File, FileAudio, FileImage, FileText, FileVideo, Trash2 } from "lucide-react";
 import type { CanvasAttachment } from "./attachments";
 import { getAttachmentAssetUrl, readAttachmentBytes, readAttachmentText } from "./storage";
 
@@ -46,6 +46,10 @@ function splitTextPages(text: string) {
 }
 
 function AttachmentIcon({ attachment }: { attachment: CanvasAttachment }) {
+  if (attachment.kind === "audio") {
+    return <FileAudio size={28} />;
+  }
+
   if (attachment.kind === "video") {
     return <FileVideo size={28} />;
   }
@@ -222,6 +226,29 @@ function VideoPreview({ attachment }: { attachment: CanvasAttachment }) {
   );
 }
 
+function AudioPreview({ attachment }: { attachment: CanvasAttachment }) {
+  const assetUrl = useMemo(
+    () => getAttachmentAssetUrl(attachment.path),
+    [attachment.path],
+  );
+
+  return (
+    <div className="attachment-audio-preview">
+      <FileAudio size={32} />
+      <div>
+        <strong>{attachment.name}</strong>
+        <span>{attachment.extension.toUpperCase() || "AUDIO"}</span>
+      </div>
+      <audio
+        className="attachment-audio"
+        controls
+        preload="metadata"
+        src={assetUrl}
+      />
+    </div>
+  );
+}
+
 function AttachmentPreviewBody({ attachment }: { attachment: CanvasAttachment }) {
   if (attachment.displayMode === "icon") {
     return (
@@ -237,6 +264,10 @@ function AttachmentPreviewBody({ attachment }: { attachment: CanvasAttachment })
 
   if (attachment.kind === "video") {
     return <VideoPreview attachment={attachment} />;
+  }
+
+  if (attachment.kind === "audio") {
+    return <AudioPreview attachment={attachment} />;
   }
 
   if (attachment.kind === "pdf") {

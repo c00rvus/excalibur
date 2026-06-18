@@ -18,7 +18,13 @@ export type CanvasAttachment = AttachmentAsset & {
 export const ATTACHMENTS_PAYLOAD_KEY = "excaliburAttachments";
 
 export function canPreviewAttachment(kind: AttachmentKind) {
-  return kind === "text" || kind === "pdf" || kind === "image" || kind === "video";
+  return (
+    kind === "text" ||
+    kind === "pdf" ||
+    kind === "image" ||
+    kind === "video" ||
+    kind === "audio"
+  );
 }
 
 export function getFileNameFromPath(path: string) {
@@ -48,6 +54,10 @@ export function getAttachmentKindFromExtension(extension: string): AttachmentKin
     return "video";
   }
 
+  if (["mp3", "wav", "ogg", "oga", "weba", "m4a", "aac", "flac"].includes(normalized)) {
+    return "audio";
+  }
+
   return "file";
 }
 
@@ -65,6 +75,10 @@ export function getAttachmentSize(
 
   if (kind === "video") {
     return { width: 460, height: 300 };
+  }
+
+  if (kind === "audio") {
+    return { width: 148, height: 58 };
   }
 
   if (kind === "pdf") {

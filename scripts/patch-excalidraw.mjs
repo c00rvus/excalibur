@@ -266,6 +266,306 @@ var excaliburDrawAudioElement = (element, context, appState) => {
 };
 `;
 
+const richTextRendererDev = String.raw`
+var getExcaliburTextColorRanges = (element) => {
+  const ranges = element.customData?.excaliburTextColorRanges;
+  if (!Array.isArray(ranges)) {
+    return null;
+  }
+  const textLength = String(element.originalText ?? element.text ?? "").replace(/\r\n?/g, "\n").length;
+  const normalizedRanges = ranges
+    .map((range) => ({
+      start: Math.max(0, Math.min(textLength, Number(range.start))),
+      end: Math.max(0, Math.min(textLength, Number(range.end))),
+      color: typeof range.color === "string" ? range.color : "",
+    }))
+    .filter((range) => range.color && Number.isFinite(range.start) && Number.isFinite(range.end) && range.start < range.end)
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  return normalizedRanges.length ? normalizedRanges : null;
+};
+var getExcaliburColorAtTextOffset = (ranges, offset, fallbackColor) => {
+  if (offset == null) {
+    return fallbackColor;
+  }
+  for (let index = ranges.length - 1; index >= 0; index--) {
+    const range = ranges[index];
+    if (offset >= range.start && offset < range.end) {
+      return range.color;
+    }
+  }
+  return fallbackColor;
+};
+var pushExcaliburRichTextChar = (line, char, color) => {
+  const lastSegment = line[line.length - 1];
+  if (lastSegment && lastSegment.color === color) {
+    lastSegment.text += char;
+  } else {
+    line.push({ text: char, color });
+  }
+};
+var alignExcaliburOriginalTextOffset = (originalText, renderedChar, originalOffset) => {
+  if (originalText[originalOffset] === renderedChar) {
+    return originalOffset;
+  }
+  const maxProbe = Math.min(originalText.length, originalOffset + 16);
+  for (let probe = originalOffset + 1; probe < maxProbe; probe++) {
+    if (originalText[probe] === renderedChar && originalText.slice(originalOffset, probe).trim() === "") {
+      return probe;
+    }
+  }
+  return originalOffset;
+};
+var getExcaliburRichTextLines = (element) => {
+  const ranges = getExcaliburTextColorRanges(element);
+  if (!ranges || isRTL(element.text)) {
+    return null;
+  }
+  const renderedText = String(element.text ?? "").replace(/\r\n?/g, "\n");
+  const originalText = String(element.originalText ?? element.text ?? "").replace(/\r\n?/g, "\n");
+  const lines = [[]];
+  let originalOffset = 0;
+  for (let index = 0; index < renderedText.length; index++) {
+    const char = renderedText[index];
+    if (char === "\n") {
+      if (originalText[originalOffset] === "\n") {
+        originalOffset++;
+      }
+      lines.push([]);
+      continue;
+    }
+    const alignedOffset = alignExcaliburOriginalTextOffset(originalText, char, originalOffset);
+    const color = getExcaliburColorAtTextOffset(ranges, alignedOffset, element.strokeColor);
+    pushExcaliburRichTextChar(lines[lines.length - 1], char, color);
+    originalOffset = Math.min(originalText.length, alignedOffset + 1);
+  }
+  return lines;
+};
+var drawExcaliburRichTextOnCanvas = (element, context, horizontalOffset, lineHeightPx, verticalOffset) => {
+  const richTextLines = getExcaliburRichTextLines(element);
+  if (!richTextLines) {
+    return false;
+  }
+  const previousTextAlign = context.textAlign;
+  context.textAlign = "left";
+  for (let index = 0; index < richTextLines.length; index++) {
+    const line = richTextLines[index];
+    const fullLine = line.map((segment) => segment.text).join("");
+    const lineWidth = context.measureText(fullLine).width;
+    let cursorX = horizontalOffset;
+    if (element.textAlign === "center") {
+      cursorX = horizontalOffset - lineWidth / 2;
+    } else if (element.textAlign === "right") {
+      cursorX = horizontalOffset - lineWidth;
+    }
+    const y = index * lineHeightPx + verticalOffset;
+    for (const segment of line) {
+      context.fillStyle = segment.color;
+      context.fillText(segment.text, cursorX, y);
+      cursorX += context.measureText(segment.text).width;
+    }
+  }
+  context.textAlign = previousTextAlign;
+  return true;
+};
+`;
+
+const richTextRendererProd = String.raw`;var excaliburGetTextColorRanges=e=>{let t=e.customData?.excaliburTextColorRanges;if(!Array.isArray(t))return null;let n=String(e.originalText??e.text??"").replace(/\r\n?/g,"\n").length,r=t.map(o=>({start:Math.max(0,Math.min(n,Number(o.start))),end:Math.max(0,Math.min(n,Number(o.end))),color:typeof o.color=="string"?o.color:""})).filter(o=>o.color&&Number.isFinite(o.start)&&Number.isFinite(o.end)&&o.start<o.end).sort((o,i)=>o.start-i.start||o.end-i.end);return r.length?r:null},excaliburGetColorAtTextOffset=(e,t,n)=>{if(t==null)return n;for(let r=e.length-1;r>=0;r--){let o=e[r];if(t>=o.start&&t<o.end)return o.color}return n},excaliburPushRichTextChar=(e,t,n)=>{let r=e[e.length-1];r&&r.color===n?r.text+=t:e.push({text:t,color:n})},excaliburAlignOriginalTextOffset=(e,t,n)=>{if(e[n]===t)return n;let r=Math.min(e.length,n+16);for(let o=n+1;o<r;o++)if(e[o]===t&&e.slice(n,o).trim()==="")return o;return n},excaliburGetRichTextLines=e=>{let t=excaliburGetTextColorRanges(e);if(!t||Po(e.text))return null;let n=String(e.text??"").replace(/\r\n?/g,"\n"),r=String(e.originalText??e.text??"").replace(/\r\n?/g,"\n"),o=[[]],i=0;for(let a=0;a<n.length;a++){let s=n[a];if(s==="\n"){r[i]==="\n"&&i++,o.push([]);continue}let d=excaliburAlignOriginalTextOffset(r,s,i),c=excaliburGetColorAtTextOffset(t,d,e.strokeColor);excaliburPushRichTextChar(o[o.length-1],s,c),i=Math.min(r.length,d+1)}return o},excaliburDrawRichTextOnCanvas=(e,t,n,r,o)=>{let i=excaliburGetRichTextLines(e);if(!i)return!1;let a=t.textAlign;t.textAlign="left";for(let s=0;s<i.length;s++){let d=i[s],c=d.map(p=>p.text).join(""),l=t.measureText(c).width,U=n;e.textAlign==="center"?U=n-l/2:e.textAlign==="right"&&(U=n-l);let p=s*r+o;for(let m of d)t.fillStyle=m.color,t.fillText(m.text,U,p),U+=t.measureText(m.text).width}return t.textAlign=a,!0};`;
+
+const richTextStrokeDev = String.raw`
+var EXCALIBUR_RICH_TEXT_SELECTION_MAX_AGE = 15e3;
+var getExcaliburRichTextSelectionTarget = () => {
+  return typeof window !== "undefined" ? window : globalThis;
+};
+var getExcaliburRichTextSelectionState = () => {
+  return getExcaliburRichTextSelectionTarget().__excaliburRichTextSelection ?? null;
+};
+var setExcaliburRichTextSelectionState = (selection) => {
+  getExcaliburRichTextSelectionTarget().__excaliburRichTextSelection = selection;
+};
+var clearExcaliburRichTextSelectionState = () => {
+  delete getExcaliburRichTextSelectionTarget().__excaliburRichTextSelection;
+};
+var getExcaliburWysiwygSelection = (editable) => {
+  const cachedStart = Number(editable.dataset.excaliburSelectionStart);
+  const cachedEnd = Number(editable.dataset.excaliburSelectionEnd);
+  const liveStart = editable.selectionStart;
+  const liveEnd = editable.selectionEnd;
+  const start = Number.isFinite(liveStart) && liveStart !== liveEnd ? liveStart : cachedStart;
+  const end = Number.isFinite(liveEnd) && liveStart !== liveEnd ? liveEnd : cachedEnd;
+  if (!Number.isFinite(start) || !Number.isFinite(end)) {
+    return null;
+  }
+  return {
+    start: Math.max(0, Math.min(start, end)),
+    end: Math.max(0, Math.max(start, end)),
+  };
+};
+var rememberExcaliburWysiwygSelection = (elementId, editable) => {
+  const liveStart = editable.selectionStart;
+  const liveEnd = editable.selectionEnd;
+  if (Number.isFinite(liveStart) && Number.isFinite(liveEnd) && liveStart !== liveEnd) {
+    editable.dataset.excaliburSelectionStart = String(Math.min(liveStart, liveEnd));
+    editable.dataset.excaliburSelectionEnd = String(Math.max(liveStart, liveEnd));
+  }
+  const selection = getExcaliburWysiwygSelection(editable);
+  if (selection && selection.start !== selection.end) {
+    setExcaliburRichTextSelectionState({
+      elementId,
+      start: selection.start,
+      end: selection.end,
+      text: normalizeText(editable.value),
+      updatedAt: Date.now(),
+    });
+  }
+  return selection;
+};
+var getExcaliburStoredWysiwygSelection = (appState) => {
+  const storedSelection = getExcaliburRichTextSelectionState();
+  if (!storedSelection || Date.now() - storedSelection.updatedAt > EXCALIBUR_RICH_TEXT_SELECTION_MAX_AGE) {
+    return null;
+  }
+  const editingTextElementId = appState.editingTextElement?.id;
+  if (editingTextElementId && editingTextElementId !== storedSelection.elementId) {
+    return null;
+  }
+  const selectedElementIds = appState.selectedElementIds || {};
+  if (
+    !editingTextElementId &&
+    Object.keys(selectedElementIds).length > 0 &&
+    !selectedElementIds[storedSelection.elementId]
+  ) {
+    return null;
+  }
+  return storedSelection;
+};
+var normalizeExcaliburTextColorRanges = (ranges, textLength) => {
+  if (!Array.isArray(ranges)) {
+    return [];
+  }
+  return ranges
+    .map((range) => ({
+      start: Math.max(0, Math.min(textLength, Number(range.start))),
+      end: Math.max(0, Math.min(textLength, Number(range.end))),
+      color: typeof range.color === "string" ? range.color : "",
+    }))
+    .filter((range) => range.color && Number.isFinite(range.start) && Number.isFinite(range.end) && range.start < range.end)
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+};
+var mergeExcaliburTextColorRanges = (ranges) => {
+  const merged = [];
+  for (const range of ranges) {
+    const previous = merged[merged.length - 1];
+    if (previous && previous.end === range.start && previous.color === range.color) {
+      previous.end = range.end;
+    } else {
+      merged.push({ ...range });
+    }
+  }
+  return merged;
+};
+var applyExcaliburTextColorRange = (element, start, end, color, textLength) => {
+  const previousRanges = normalizeExcaliburTextColorRanges(
+    element.customData?.excaliburTextColorRanges,
+    textLength,
+  );
+  const nextRanges = [];
+  for (const range of previousRanges) {
+    if (range.end <= start || range.start >= end) {
+      nextRanges.push(range);
+      continue;
+    }
+    if (range.start < start) {
+      nextRanges.push({ start: range.start, end: start, color: range.color });
+    }
+    if (range.end > end) {
+      nextRanges.push({ start: end, end: range.end, color: range.color });
+    }
+  }
+  if (color !== element.strokeColor) {
+    nextRanges.push({ start, end, color });
+  }
+  return mergeExcaliburTextColorRanges(
+    nextRanges
+      .filter((range) => range.start < range.end)
+      .sort((a, b) => a.start - b.start || a.end - b.end),
+  );
+};
+var createExcaliburPartialTextStrokeResult = (elements, appState, value, app) => {
+  const nextColor = value?.currentItemStrokeColor;
+  const editingTextElement = appState.editingTextElement;
+  if (!nextColor) {
+    return null;
+  }
+  let targetElementId = editingTextElement && isTextElement(editingTextElement) ? editingTextElement.id : null;
+  let selection = null;
+  let textValue = null;
+  const editable = app?.excalidrawContainerRef?.current?.querySelector("textarea.excalidraw-wysiwyg");
+  const editableElementId = editable instanceof HTMLTextAreaElement ? editable.dataset.excaliburElementId : null;
+  if (editable instanceof HTMLTextAreaElement && (targetElementId || editableElementId)) {
+    targetElementId = targetElementId || editableElementId;
+    selection = rememberExcaliburWysiwygSelection(targetElementId, editable);
+    textValue = normalizeText(editable.value);
+  }
+  const storedSelection = getExcaliburStoredWysiwygSelection(appState);
+  if ((!selection || selection.start === selection.end || !targetElementId) && storedSelection) {
+    targetElementId = storedSelection.elementId;
+    selection = {
+      start: storedSelection.start,
+      end: storedSelection.end,
+    };
+    textValue = normalizeText(storedSelection.text ?? "");
+  }
+  if (!selection || selection.start === selection.end || !targetElementId) {
+    return null;
+  }
+  const element = elements.find((candidate) => candidate.id === targetElementId);
+  if (!element || !isTextElement(element)) {
+    return null;
+  }
+  textValue = textValue || normalizeText(element.originalText ?? element.text ?? "");
+  const textLength = textValue.length;
+  const selectedStart = Math.min(selection.start, textValue.length);
+  const selectedEnd = Math.min(selection.end, textValue.length);
+  if (selectedStart === selectedEnd) {
+    return null;
+  }
+  const isWholeTextSelection = selectedStart === 0 && selectedEnd === textLength;
+  const nextRanges = isWholeTextSelection
+    ? []
+    : applyExcaliburTextColorRange(element, selectedStart, selectedEnd, nextColor, textLength);
+  const nextCustomData = { ...(element.customData || {}) };
+  if (nextRanges.length) {
+    nextCustomData.excaliburTextColorRanges = nextRanges;
+  } else {
+    delete nextCustomData.excaliburTextColorRanges;
+  }
+  const nextElement = newElementWith(
+    element,
+    {
+      strokeColor: isWholeTextSelection ? nextColor : element.strokeColor,
+      customData: nextCustomData,
+    },
+    true,
+  );
+  clearExcaliburRichTextSelectionState();
+  if (editable instanceof HTMLTextAreaElement) {
+    window.setTimeout(() => {
+      editable.dispatchEvent(new Event("excalibur-rich-text-format-applied"));
+    });
+  }
+  return {
+    elements: elements.map((candidate) => candidate.id === element.id ? nextElement : candidate),
+    appState: {
+      ...appState,
+      ...value,
+    },
+    captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+  };
+};
+`;
+
+const richTextStrokeProd = String.raw`;var EXCALIBUR_RICH_TEXT_SELECTION_MAX_AGE=15e3,excaliburGetRichTextSelectionTarget=()=>typeof window!="undefined"?window:globalThis,excaliburGetRichTextSelectionState=()=>excaliburGetRichTextSelectionTarget().__excaliburRichTextSelection??null,excaliburSetRichTextSelectionState=e=>{excaliburGetRichTextSelectionTarget().__excaliburRichTextSelection=e},excaliburClearRichTextSelectionState=()=>{delete excaliburGetRichTextSelectionTarget().__excaliburRichTextSelection},excaliburGetWysiwygSelection=e=>{let o=Number(e.dataset.excaliburSelectionStart),t=Number(e.dataset.excaliburSelectionEnd),r=e.selectionStart,n=e.selectionEnd,i=Number.isFinite(r)&&r!==n?r:o,a=Number.isFinite(n)&&r!==n?n:t;return Number.isFinite(i)&&Number.isFinite(a)?{start:Math.max(0,Math.min(i,a)),end:Math.max(0,Math.max(i,a))}:null},excaliburRememberWysiwygSelection=(e,o)=>{let t=o.selectionStart,r=o.selectionEnd;Number.isFinite(t)&&Number.isFinite(r)&&t!==r&&(o.dataset.excaliburSelectionStart=String(Math.min(t,r)),o.dataset.excaliburSelectionEnd=String(Math.max(t,r)));let n=excaliburGetWysiwygSelection(o);return n&&n.start!==n.end&&excaliburSetRichTextSelectionState({elementId:e,start:n.start,end:n.end,text:tn(o.value),updatedAt:Date.now()}),n},excaliburGetStoredWysiwygSelection=e=>{let o=excaliburGetRichTextSelectionState();if(!o||Date.now()-o.updatedAt>EXCALIBUR_RICH_TEXT_SELECTION_MAX_AGE)return null;let t=e.editingTextElement?.id,r=e.selectedElementIds||{};return t&&t!==o.elementId?null:!t&&Object.keys(r).length>0&&!r[o.elementId]?null:o},excaliburNormalizeTextColorRanges=(e,o)=>Array.isArray(e)?e.map(t=>({start:Math.max(0,Math.min(o,Number(t.start))),end:Math.max(0,Math.min(o,Number(t.end))),color:typeof t.color=="string"?t.color:""})).filter(t=>t.color&&Number.isFinite(t.start)&&Number.isFinite(t.end)&&t.start<t.end).sort((t,r)=>t.start-r.start||t.end-r.end):[],excaliburMergeTextColorRanges=e=>{let o=[];for(let t of e){let r=o[o.length-1];r&&r.end===t.start&&r.color===t.color?r.end=t.end:o.push({...t})}return o},excaliburApplyTextColorRange=(e,o,t,r,n)=>{let i=excaliburNormalizeTextColorRanges(e.customData?.excaliburTextColorRanges,n),a=[];for(let l of i)l.end<=o||l.start>=t?a.push(l):(l.start<o&&a.push({start:l.start,end:o,color:l.color}),l.end>t&&a.push({start:t,end:l.end,color:l.color}));return r!==e.strokeColor&&a.push({start:o,end:t,color:r}),excaliburMergeTextColorRanges(a.filter(l=>l.start<l.end).sort((l,s)=>l.start-s.start||l.end-s.end))},excaliburPartialTextStroke=(e,o,t,r)=>{let n=t?.currentItemStrokeColor;if(!n)return null;let i=o.editingTextElement,a=i&&Y(i)?i.id:null,l=null,s=null,c=r?.excalidrawContainerRef?.current?.querySelector("textarea.excalidraw-wysiwyg"),m=c instanceof HTMLTextAreaElement?c.dataset.excaliburElementId:null;c instanceof HTMLTextAreaElement&&(a||m)&&(a=a||m,l=excaliburRememberWysiwygSelection(a,c),s=tn(c.value));let d=excaliburGetStoredWysiwygSelection(o);if((!l||l.start===l.end||!a)&&d&&(a=d.elementId,l={start:d.start,end:d.end},s=tn(d.text??"")),!l||l.start===l.end||!a)return null;let p=e.find(u=>u.id===a);if(!p||!Y(p))return null;s=s||tn(p.originalText??p.text??"");let u=s.length,h=Math.min(l.start,u),f=Math.min(l.end,u);if(h===f)return null;let b=h===0&&f===u,x=b?[]:excaliburApplyTextColorRange(p,h,f,n,u),T={...(p.customData||{})};x.length?T.excaliburTextColorRanges=x:delete T.excaliburTextColorRanges;let w=q(p,{strokeColor:b?n:p.strokeColor,customData:T},!0);return excaliburClearRichTextSelectionState(),c instanceof HTMLTextAreaElement&&setTimeout(()=>{c.dispatchEvent(new Event("excalibur-rich-text-format-applied"))}),{elements:e.map(C=>C.id===p.id?w:C),appState:{...o,...t},captureUpdate:L.IMMEDIATELY}};`;
+
 function replaceOnce(content, search, replacement, file, label) {
   if (content.includes(replacement)) {
     return content;
@@ -365,6 +665,90 @@ function patchProdAudioDrawer(content, file) {
   );
 }
 
+function patchDevRichTextRenderer(content, file) {
+  const startMarker = "\nvar getExcaliburTextColorRanges =";
+  const drawMarker = "\nvar drawElementOnCanvas =";
+  const start = content.indexOf(startMarker);
+  const drawIndex = content.indexOf(drawMarker, start === -1 ? 0 : start);
+
+  if (start !== -1 && drawIndex !== -1 && start < drawIndex) {
+    return content.slice(0, start) + richTextRendererDev + content.slice(drawIndex);
+  }
+
+  return replaceOnce(
+    content,
+    drawMarker,
+    `${richTextRendererDev}${drawMarker}`,
+    file,
+    "rich text canvas renderer",
+  );
+}
+
+function patchProdRichTextRenderer(content, file) {
+  const startMarker = ";var excaliburGetTextColorRanges=";
+  const drawMarker = ";var ni=(e,t,n,r,o)=>{switch(e.type)";
+  const start = content.indexOf(startMarker);
+  const drawIndex = content.indexOf(drawMarker, start === -1 ? 0 : start);
+
+  if (start !== -1 && drawIndex !== -1 && start < drawIndex) {
+    return content.slice(0, start) + richTextRendererProd + content.slice(drawIndex);
+  }
+
+  return replaceOnce(
+    content,
+    drawMarker,
+    `${richTextRendererProd}${drawMarker}`,
+    file,
+    "prod rich text canvas renderer",
+  );
+}
+
+function patchDevRichTextStrokeHelper(content, file) {
+  const startMarker = "\nvar EXCALIBUR_RICH_TEXT_SELECTION_MAX_AGE =";
+  const legacyStartMarker = "\nvar getExcaliburWysiwygSelection =";
+  const actionMarker = "\nvar actionChangeStrokeColor = register({";
+  let start = content.indexOf(startMarker);
+  if (start === -1) {
+    start = content.indexOf(legacyStartMarker);
+  }
+  const actionIndex = content.indexOf(actionMarker, start === -1 ? 0 : start);
+
+  if (start !== -1 && actionIndex !== -1 && start < actionIndex) {
+    return content.slice(0, start) + richTextStrokeDev + content.slice(actionIndex);
+  }
+
+  return replaceOnce(
+    content,
+    actionMarker,
+    `${richTextStrokeDev}${actionMarker}`,
+    file,
+    "dev partial text stroke helper",
+  );
+}
+
+function patchProdRichTextStrokeHelper(content, file) {
+  const startMarker = ";var EXCALIBUR_RICH_TEXT_SELECTION_MAX_AGE=";
+  const legacyStartMarker = ";var excaliburGetWysiwygSelection=";
+  const actionMarker = 'var U2=D({name:"changeStrokeColor"';
+  let start = content.indexOf(startMarker);
+  if (start === -1) {
+    start = content.indexOf(legacyStartMarker);
+  }
+  const actionIndex = content.indexOf(actionMarker, start === -1 ? 0 : start);
+
+  if (start !== -1 && actionIndex !== -1 && start < actionIndex) {
+    return content.slice(0, start) + richTextStrokeProd + content.slice(actionIndex);
+  }
+
+  return replaceOnce(
+    content,
+    ',U2=D({name:"changeStrokeColor"',
+    `${richTextStrokeProd}var U2=D({name:"changeStrokeColor"`,
+    file,
+    "prod partial text stroke helper",
+  );
+}
+
 const devAudioShapeAfterEraser =
   'value: "image",\n    key: null,\n    numericKey: KEYS["9"],\n    fillable: false\n  },\n  {\n    icon: EraserIcon,\n    value: "eraser",\n    key: KEYS.E,\n    numericKey: KEYS["0"],\n    fillable: false\n  },\n  {\n    icon: microphoneIcon,\n    value: "audio",\n    key: null,\n    numericKey: null,\n    fillable: false\n  }\n];';
 
@@ -417,10 +801,26 @@ patchFile(files.devCore, [
     "audio rect intersection",
   ),
   patchDevAudioDrawer,
+  patchDevRichTextRenderer,
   rep(
     'case "image": {\n      const img =',
     'case "audio": {\n      drawExcaliburAudioElement(element, context, appState);\n      break;\n    }\n    case "image": {\n      const img =',
     "audio draw switch",
+  ),
+  rep(
+    '        for (let index = 0; index < lines.length; index++) {\n          context.fillText(\n            lines[index],\n            horizontalOffset,\n            index * lineHeightPx + verticalOffset\n          );\n        }',
+    '        if (!drawExcaliburRichTextOnCanvas(element, context, horizontalOffset, lineHeightPx, verticalOffset)) {\n          for (let index = 0; index < lines.length; index++) {\n            context.fillText(\n              lines[index],\n              horizontalOffset,\n              index * lineHeightPx + verticalOffset\n            );\n          }\n        }',
+    "rich text canvas draw",
+  ),
+  rep(
+    '        const lines = element.text.replace(/\\r\\n?/g, "\\n").split("\\n");',
+    '        const richTextLines = getExcaliburRichTextLines(element);\n        const lines = richTextLines ? richTextLines.map((line) => line.map((segment) => segment.text).join("")) : element.text.replace(/\\r\\n?/g, "\\n").split("\\n");',
+    "rich text svg lines",
+  ),
+  rep(
+    '          text.textContent = lines[i];',
+    '          const richTextLine = richTextLines?.[i];\n          if (richTextLine) {\n            richTextLine.forEach((segment) => {\n              const tspan = svgRoot.ownerDocument.createElementNS(SVG_NS, "tspan");\n              tspan.textContent = segment.text;\n              tspan.setAttribute("fill", segment.color);\n              text.appendChild(tspan);\n            });\n          } else {\n            text.textContent = lines[i];\n          }',
+    "rich text svg tspans",
   ),
   rep(
     'case "arrow":\n    case "image":\n    case "text":',
@@ -482,10 +882,26 @@ patchFile(files.prodCore, [
     "prod audio rect intersection",
   ),
   patchProdAudioDrawer,
+  patchProdRichTextRenderer,
   rep(
     'case"image":{let i=At(e)?r.imageCache.get(e.fileId)?.image:void 0;',
     'case"audio":{excaliburDrawAudioElement(e,n,o);break}case"image":{let i=At(e)?r.imageCache.get(e.fileId)?.image:void 0;',
     "prod audio draw switch",
+  ),
+  rep(
+    'n.fillStyle=e.strokeColor,n.textAlign=e.textAlign;let s=e.text.replace(/\\r\\n?/g,`\n`).split(`\n`),d=e.textAlign==="center"?e.width/2:e.textAlign==="right"?e.width:0,c=Zn(e.fontSize,e.lineHeight),l=Go(e.fontFamily,e.fontSize,c);for(let U=0;U<s.length;U++)n.fillText(s[U],d,U*c+l);n.restore()',
+    'n.fillStyle=e.strokeColor,n.textAlign=e.textAlign;let s=e.text.replace(/\\r\\n?/g,`\n`).split(`\n`),d=e.textAlign==="center"?e.width/2:e.textAlign==="right"?e.width:0,c=Zn(e.fontSize,e.lineHeight),l=Go(e.fontFamily,e.fontSize,c);if(!excaliburDrawRichTextOnCanvas(e,n,d,c,l))for(let U=0;U<s.length;U++)n.fillText(s[U],d,U*c+l);n.restore()',
+    "prod rich text canvas draw",
+  ),
+  rep(
+    'let w=e.text.replace(/\\r\\n?/g,`\n`).split(`\n`),I=Zn(e.fontSize,e.lineHeight),S=e.textAlign==="center"?e.width/2:e.textAlign==="right"?e.width:0,v=Go(e.fontFamily,e.fontSize,I),D=Po(e.text)?"rtl":"ltr",$=e.textAlign==="center"?"middle":e.textAlign==="right"||D==="rtl"?"end":"start";',
+    'let excaliburRichLines=excaliburGetRichTextLines(e),w=excaliburRichLines?excaliburRichLines.map(N=>N.map(B=>B.text).join("")):e.text.replace(/\\r\\n?/g,`\n`).split(`\n`),I=Zn(e.fontSize,e.lineHeight),S=e.textAlign==="center"?e.width/2:e.textAlign==="right"?e.width:0,v=Go(e.fontFamily,e.fontSize,I),D=Po(e.text)?"rtl":"ltr",$=e.textAlign==="center"?"middle":e.textAlign==="right"||D==="rtl"?"end":"start";',
+    "prod rich text svg lines",
+  ),
+  rep(
+    '_.textContent=w[B],_.setAttribute("x",`${S}`)',
+    '(excaliburRichLines?.[B]?excaliburRichLines[B].forEach(N=>{let j=r.ownerDocument.createElementNS(re,"tspan");j.textContent=N.text,j.setAttribute("fill",N.color),_.appendChild(j)}):_.textContent=w[B]),_.setAttribute("x",`${S}`)',
+    "prod rich text svg tspans",
   ),
   rep(
     'case"rectangle":case"diamond":case"ellipse":case"line":case"arrow":case"image":case"text":case"iframe":case"embeddable"',
@@ -510,6 +926,33 @@ patchFile(files.prodCore, [
 ]);
 
 patchFile(files.devIndex, [
+  repOptional(
+    '  const cacheExcaliburTextSelection = () => {\n    editable.dataset.excaliburSelectionStart = String(editable.selectionStart);\n    editable.dataset.excaliburSelectionEnd = String(editable.selectionEnd);\n  };\n  ["select", "keyup", "mouseup", "pointerup", "input"].forEach((eventName) => {\n    editable.addEventListener(eventName, cacheExcaliburTextSelection);\n  });\n  editable.value = element.originalText;\n  cacheExcaliburTextSelection();\n  updateWysiwygStyle();',
+    '  editable.dataset.excaliburElementId = element.id;\n  const cacheExcaliburTextSelection = () => {\n    rememberExcaliburWysiwygSelection(element.id, editable);\n  };\n  ["select", "keyup", "mouseup", "pointerup", "input", "blur"].forEach((eventName) => {\n    editable.addEventListener(eventName, cacheExcaliburTextSelection);\n  });\n  editable.value = element.originalText;\n  cacheExcaliburTextSelection();\n  updateWysiwygStyle();',
+  ),
+  repOptional(
+    '  const cacheExcaliburTextSelection = () => {\n    rememberExcaliburWysiwygSelection(element.id, editable);\n  };\n  ["select", "keyup", "mouseup", "pointerup", "input", "blur"].forEach((eventName) => {\n    editable.addEventListener(eventName, cacheExcaliburTextSelection);\n  });\n  editable.value = element.originalText;\n  cacheExcaliburTextSelection();\n  updateWysiwygStyle();',
+    '  editable.dataset.excaliburElementId = element.id;\n  const cacheExcaliburTextSelection = () => {\n    rememberExcaliburWysiwygSelection(element.id, editable);\n  };\n  ["select", "keyup", "mouseup", "pointerup", "input", "blur"].forEach((eventName) => {\n    editable.addEventListener(eventName, cacheExcaliburTextSelection);\n  });\n  editable.value = element.originalText;\n  cacheExcaliburTextSelection();\n  updateWysiwygStyle();',
+  ),
+  rep(
+    '  editable.value = element.originalText;\n  updateWysiwygStyle();',
+    '  editable.dataset.excaliburElementId = element.id;\n  const cacheExcaliburTextSelection = () => {\n    rememberExcaliburWysiwygSelection(element.id, editable);\n  };\n  ["select", "keyup", "mouseup", "pointerup", "input", "blur"].forEach((eventName) => {\n    editable.addEventListener(eventName, cacheExcaliburTextSelection);\n  });\n  editable.value = element.originalText;\n  cacheExcaliburTextSelection();\n  updateWysiwygStyle();',
+    "dev wysiwyg selection cache",
+  ),
+  repOptional(
+    '  let isDestroyed = false;\n  editable.addEventListener("excalibur-rich-text-split", () => {\n    if (isDestroyed) {\n      return;\n    }\n    isDestroyed = true;\n    cleanup();\n  });\n  if (autoSelect) {',
+    '  let isDestroyed = false;\n  editable.addEventListener("excalibur-rich-text-format-applied", () => {\n    if (isDestroyed) {\n      return;\n    }\n    handleSubmit();\n  });\n  if (autoSelect) {',
+  ),
+  repOptional(
+    '  let isDestroyed = false;\n  if (autoSelect) {',
+    '  let isDestroyed = false;\n  editable.addEventListener("excalibur-rich-text-format-applied", () => {\n    if (isDestroyed) {\n      return;\n    }\n    handleSubmit();\n  });\n  if (autoSelect) {',
+  ),
+  patchDevRichTextStrokeHelper,
+  rep(
+    '  perform: (elements, appState, value) => {\n    return {',
+    '  perform: (elements, appState, value, app) => {\n    const partialTextStrokeResult = createExcaliburPartialTextStrokeResult(elements, appState, value, app);\n    if (partialTextStrokeResult) {\n      return partialTextStrokeResult;\n    }\n    return {',
+    "dev partial text stroke action",
+  ),
   rep(
     'const label = t(`toolBar.${value}`);',
     'const label = value === "audio" ? "Audio" : t(`toolBar.${value}`);',
@@ -523,6 +966,41 @@ patchFile(files.devIndex, [
 ]);
 
 patchFile(files.prodIndex, [
+  repOptional(
+    'd.value=n.originalText;let excaliburCacheTextSelection=()=>{d.dataset.excaliburSelectionStart=String(d.selectionStart),d.dataset.excaliburSelectionEnd=String(d.selectionEnd)};["select","keyup","mouseup","pointerup","input"].forEach(F=>{d.addEventListener(F,excaliburCacheTextSelection)}),excaliburCacheTextSelection(),m(),o&&',
+    'd.dataset.excaliburElementId=n.id,d.value=n.originalText;let excaliburCacheTextSelection=()=>{excaliburRememberWysiwygSelection(n.id,d)};["select","keyup","mouseup","pointerup","input","blur"].forEach(F=>{d.addEventListener(F,excaliburCacheTextSelection)}),excaliburCacheTextSelection(),m(),o&&',
+  ),
+  repOptional(
+    'd.value=n.originalText;let excaliburCacheTextSelection=()=>{excaliburRememberWysiwygSelection(n.id,d)};["select","keyup","mouseup","pointerup","input","blur"].forEach(F=>{d.addEventListener(F,excaliburCacheTextSelection)}),excaliburCacheTextSelection(),m(),o&&',
+    'd.dataset.excaliburElementId=n.id,d.value=n.originalText;let excaliburCacheTextSelection=()=>{excaliburRememberWysiwygSelection(n.id,d)};["select","keyup","mouseup","pointerup","input","blur"].forEach(F=>{d.addEventListener(F,excaliburCacheTextSelection)}),excaliburCacheTextSelection(),m(),o&&',
+  ),
+  rep(
+    'd.value=n.originalText,m(),o&&',
+    'd.dataset.excaliburElementId=n.id,d.value=n.originalText;let excaliburCacheTextSelection=()=>{excaliburRememberWysiwygSelection(n.id,d)};["select","keyup","mouseup","pointerup","input","blur"].forEach(F=>{d.addEventListener(F,excaliburCacheTextSelection)}),excaliburCacheTextSelection(),m(),o&&',
+    "prod wysiwyg selection cache",
+  ),
+  repOptional(
+    'G=l.onScrollChangeEmitter.on(()=>{m()}),H=!1,d.addEventListener("excalibur-rich-text-split",()=>{H||(H=!0,O())});s&&d.select(),k();',
+    'G=l.onScrollChangeEmitter.on(()=>{m()}),H=!1;d.addEventListener("excalibur-rich-text-format-applied",()=>{H||I()}),s&&d.select(),k();',
+  ),
+  repOptional(
+    'G=l.onScrollChangeEmitter.on(()=>{m()}),H=!1;d.addEventListener("excalibur-rich-text-split",()=>{H||(H=!0,O())});s&&d.select(),k();',
+    'G=l.onScrollChangeEmitter.on(()=>{m()}),H=!1;d.addEventListener("excalibur-rich-text-format-applied",()=>{H||I()}),s&&d.select(),k();',
+  ),
+  repOptional(
+    'G=l.onScrollChangeEmitter.on(()=>{m()}),H=!1;s&&d.select(),k();',
+    'G=l.onScrollChangeEmitter.on(()=>{m()}),H=!1;d.addEventListener("excalibur-rich-text-format-applied",()=>{H||I()}),s&&d.select(),k();',
+  ),
+  repOptional(
+    'G=l.onScrollChangeEmitter.on(()=>{m()}),H=!1,d.addEventListener("excalibur-rich-text-format-applied",()=>{H||I()}),s&&d.select(),k();',
+    'G=l.onScrollChangeEmitter.on(()=>{m()}),H=!1;d.addEventListener("excalibur-rich-text-format-applied",()=>{H||I()}),s&&d.select(),k();',
+  ),
+  patchProdRichTextStrokeHelper,
+  rep(
+    'perform:(e,o,t)=>({...t.currentItemStrokeColor&&{elements:wt(e,o,r=>Ia(r.type)?q(r,{strokeColor:t.currentItemStrokeColor}):r,!0)},appState:{...o,...t},captureUpdate:t.currentItemStrokeColor?L.IMMEDIATELY:L.EVENTUALLY})',
+    'perform:(e,o,t,r)=>excaliburPartialTextStroke(e,o,t,r)||({...t.currentItemStrokeColor&&{elements:wt(e,o,n=>Ia(n.type)?q(n,{strokeColor:t.currentItemStrokeColor}):n,!0)},appState:{...o,...t},captureUpdate:t.currentItemStrokeColor?L.IMMEDIATELY:L.EVENTUALLY})',
+    "prod partial text stroke action",
+  ),
   rep(
     'let b=g(`toolBar.${m}`),',
     'let b=m==="audio"?"Audio":g(`toolBar.${m}`),',

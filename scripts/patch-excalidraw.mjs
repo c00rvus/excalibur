@@ -490,6 +490,125 @@ var applyExcaliburTextColorRange = (element, start, end, color, textLength) => {
       .sort((a, b) => a.start - b.start || a.end - b.end),
   );
 };
+var getExcaliburWysiwygTextColorRanges = (element, textValue) => {
+  const normalizedText = normalizeText(String(textValue ?? element.originalText ?? element.text ?? ""));
+  return normalizeExcaliburTextColorRanges(
+    element.customData?.excaliburTextColorRanges,
+    normalizedText.length,
+  );
+};
+var getExcaliburWysiwygColorAtOffset = (ranges, offset, fallbackColor) => {
+  for (let index = ranges.length - 1; index >= 0; index--) {
+    const range = ranges[index];
+    if (offset >= range.start && offset < range.end) {
+      return range.color;
+    }
+  }
+  return fallbackColor;
+};
+var appendExcaliburWysiwygMirrorSegment = (mirror, text, color) => {
+  const span = mirror.ownerDocument.createElement("span");
+  span.textContent = text;
+  span.style.color = color;
+  mirror.appendChild(span);
+};
+var renderExcaliburWysiwygMirrorText = (mirror, text, ranges, fallbackColor) => {
+  mirror.replaceChildren();
+  const normalizedText = normalizeText(String(text ?? ""));
+  if (!normalizedText) {
+    appendExcaliburWysiwygMirrorSegment(mirror, "\u200b", fallbackColor);
+    return;
+  }
+  let pendingText = "";
+  let pendingColor = null;
+  const flushPending = () => {
+    if (pendingText) {
+      appendExcaliburWysiwygMirrorSegment(mirror, pendingText, pendingColor || fallbackColor);
+      pendingText = "";
+    }
+  };
+  for (let offset = 0; offset < normalizedText.length; offset++) {
+    const char = normalizedText[offset];
+    if (char === "\n") {
+      flushPending();
+      mirror.appendChild(mirror.ownerDocument.createElement("br"));
+      if (offset === normalizedText.length - 1) {
+        appendExcaliburWysiwygMirrorSegment(mirror, "\u200b", fallbackColor);
+      }
+      continue;
+    }
+    const color = getExcaliburWysiwygColorAtOffset(ranges, offset, fallbackColor);
+    if (pendingColor !== color) {
+      flushPending();
+      pendingColor = color;
+    }
+    pendingText += char;
+  }
+  flushPending();
+};
+var createExcaliburWysiwygMirror = () => {
+  const mirror = document.createElement("div");
+  mirror.className = "excalibur-rich-text-wysiwyg-mirror";
+  Object.assign(mirror.style, {
+    position: "absolute",
+    display: "none",
+    minHeight: "1em",
+    backfaceVisibility: "hidden",
+    margin: 0,
+    padding: 0,
+    border: 0,
+    outline: 0,
+    resize: "none",
+    background: "transparent",
+    overflow: "hidden",
+    pointerEvents: "none",
+    userSelect: "none",
+    zIndex: "var(--zIndex-wysiwyg)",
+    boxSizing: "content-box",
+  });
+  return mirror;
+};
+var syncExcaliburWysiwygMirror = (mirror, editable, element, updatedTextElement = element) => {
+  const sourceElement = updatedTextElement || element;
+  const ranges = getExcaliburWysiwygTextColorRanges(sourceElement, editable.value);
+  editable.style.caretColor = sourceElement.strokeColor;
+  if (!ranges.length) {
+    mirror.style.display = "none";
+    editable.style.color = sourceElement.strokeColor;
+    editable.style.webkitTextFillColor = "";
+    return;
+  }
+  const copiedStyleProperties = [
+    "font",
+    "fontFamily",
+    "fontSize",
+    "fontWeight",
+    "fontStyle",
+    "lineHeight",
+    "width",
+    "height",
+    "left",
+    "top",
+    "transform",
+    "textAlign",
+    "verticalAlign",
+    "opacity",
+    "filter",
+    "maxHeight",
+    "wordBreak",
+    "whiteSpace",
+    "overflowWrap",
+  ];
+  for (const property of copiedStyleProperties) {
+    mirror.style[property] = editable.style[property];
+  }
+  mirror.dir = editable.dir;
+  mirror.style.display = editable.style.display || "inline-block";
+  mirror.style.color = sourceElement.strokeColor;
+  renderExcaliburWysiwygMirrorText(mirror, editable.value, ranges, sourceElement.strokeColor);
+  editable.style.color = "transparent";
+  editable.style.webkitTextFillColor = "transparent";
+};
 var createExcaliburPartialTextStrokeResult = (elements, appState, value, app) => {
   const nextColor = value?.currentItemStrokeColor;
   const editingTextElement = appState.editingTextElement;
@@ -564,7 +683,7 @@ var createExcaliburPartialTextStrokeResult = (elements, appState, value, app) =>
 };
 `;
 
-const richTextStrokeProd = String.raw`;var EXCALIBUR_RICH_TEXT_SELECTION_MAX_AGE=15e3,excaliburGetRichTextSelectionTarget=()=>typeof window!="undefined"?window:globalThis,excaliburGetRichTextSelectionState=()=>excaliburGetRichTextSelectionTarget().__excaliburRichTextSelection??null,excaliburSetRichTextSelectionState=e=>{excaliburGetRichTextSelectionTarget().__excaliburRichTextSelection=e},excaliburClearRichTextSelectionState=()=>{delete excaliburGetRichTextSelectionTarget().__excaliburRichTextSelection},excaliburGetWysiwygSelection=e=>{let o=Number(e.dataset.excaliburSelectionStart),t=Number(e.dataset.excaliburSelectionEnd),r=e.selectionStart,n=e.selectionEnd,i=Number.isFinite(r)&&r!==n?r:o,a=Number.isFinite(n)&&r!==n?n:t;return Number.isFinite(i)&&Number.isFinite(a)?{start:Math.max(0,Math.min(i,a)),end:Math.max(0,Math.max(i,a))}:null},excaliburRememberWysiwygSelection=(e,o)=>{let t=o.selectionStart,r=o.selectionEnd;Number.isFinite(t)&&Number.isFinite(r)&&t!==r&&(o.dataset.excaliburSelectionStart=String(Math.min(t,r)),o.dataset.excaliburSelectionEnd=String(Math.max(t,r)));let n=excaliburGetWysiwygSelection(o);return n&&n.start!==n.end&&excaliburSetRichTextSelectionState({elementId:e,start:n.start,end:n.end,text:tn(o.value),updatedAt:Date.now()}),n},excaliburGetStoredWysiwygSelection=e=>{let o=excaliburGetRichTextSelectionState();if(!o||Date.now()-o.updatedAt>EXCALIBUR_RICH_TEXT_SELECTION_MAX_AGE)return null;let t=e.editingTextElement?.id,r=e.selectedElementIds||{};return t&&t!==o.elementId?null:!t&&Object.keys(r).length>0&&!r[o.elementId]?null:o},excaliburNormalizeTextColorRanges=(e,o)=>Array.isArray(e)?e.map(t=>({start:Math.max(0,Math.min(o,Number(t.start))),end:Math.max(0,Math.min(o,Number(t.end))),color:typeof t.color=="string"?t.color:""})).filter(t=>t.color&&Number.isFinite(t.start)&&Number.isFinite(t.end)&&t.start<t.end).sort((t,r)=>t.start-r.start||t.end-r.end):[],excaliburMergeTextColorRanges=e=>{let o=[];for(let t of e){let r=o[o.length-1];r&&r.end===t.start&&r.color===t.color?r.end=t.end:o.push({...t})}return o},excaliburApplyTextColorRange=(e,o,t,r,n)=>{let i=excaliburNormalizeTextColorRanges(e.customData?.excaliburTextColorRanges,n),a=[];for(let l of i)l.end<=o||l.start>=t?a.push(l):(l.start<o&&a.push({start:l.start,end:o,color:l.color}),l.end>t&&a.push({start:t,end:l.end,color:l.color}));return r!==e.strokeColor&&a.push({start:o,end:t,color:r}),excaliburMergeTextColorRanges(a.filter(l=>l.start<l.end).sort((l,s)=>l.start-s.start||l.end-s.end))},excaliburPartialTextStroke=(e,o,t,r)=>{let n=t?.currentItemStrokeColor;if(!n)return null;let i=o.editingTextElement,a=i&&Y(i)?i.id:null,l=null,s=null,c=r?.excalidrawContainerRef?.current?.querySelector("textarea.excalidraw-wysiwyg"),m=c instanceof HTMLTextAreaElement?c.dataset.excaliburElementId:null;c instanceof HTMLTextAreaElement&&(a||m)&&(a=a||m,l=excaliburRememberWysiwygSelection(a,c),s=tn(c.value));let d=excaliburGetStoredWysiwygSelection(o);if((!l||l.start===l.end||!a)&&d&&(a=d.elementId,l={start:d.start,end:d.end},s=tn(d.text??"")),!l||l.start===l.end||!a)return null;let p=e.find(u=>u.id===a);if(!p||!Y(p))return null;s=s||tn(p.originalText??p.text??"");let u=s.length,h=Math.min(l.start,u),f=Math.min(l.end,u);if(h===f)return null;let b=h===0&&f===u,x=b?[]:excaliburApplyTextColorRange(p,h,f,n,u),T={...(p.customData||{})};x.length?T.excaliburTextColorRanges=x:delete T.excaliburTextColorRanges;let w=q(p,{strokeColor:b?n:p.strokeColor,customData:T},!0);return excaliburClearRichTextSelectionState(),c instanceof HTMLTextAreaElement&&setTimeout(()=>{c.dispatchEvent(new Event("excalibur-rich-text-format-applied"))}),{elements:e.map(C=>C.id===p.id?w:C),appState:{...o,...t},captureUpdate:L.IMMEDIATELY}};`;
+const richTextStrokeProd = String.raw`;var EXCALIBUR_RICH_TEXT_SELECTION_MAX_AGE=15e3,excaliburGetRichTextSelectionTarget=()=>typeof window!="undefined"?window:globalThis,excaliburGetRichTextSelectionState=()=>excaliburGetRichTextSelectionTarget().__excaliburRichTextSelection??null,excaliburSetRichTextSelectionState=e=>{excaliburGetRichTextSelectionTarget().__excaliburRichTextSelection=e},excaliburClearRichTextSelectionState=()=>{delete excaliburGetRichTextSelectionTarget().__excaliburRichTextSelection},excaliburGetWysiwygSelection=e=>{let o=Number(e.dataset.excaliburSelectionStart),t=Number(e.dataset.excaliburSelectionEnd),r=e.selectionStart,n=e.selectionEnd,i=Number.isFinite(r)&&r!==n?r:o,a=Number.isFinite(n)&&r!==n?n:t;return Number.isFinite(i)&&Number.isFinite(a)?{start:Math.max(0,Math.min(i,a)),end:Math.max(0,Math.max(i,a))}:null},excaliburRememberWysiwygSelection=(e,o)=>{let t=o.selectionStart,r=o.selectionEnd;Number.isFinite(t)&&Number.isFinite(r)&&t!==r&&(o.dataset.excaliburSelectionStart=String(Math.min(t,r)),o.dataset.excaliburSelectionEnd=String(Math.max(t,r)));let n=excaliburGetWysiwygSelection(o);return n&&n.start!==n.end&&excaliburSetRichTextSelectionState({elementId:e,start:n.start,end:n.end,text:tn(o.value),updatedAt:Date.now()}),n},excaliburGetStoredWysiwygSelection=e=>{let o=excaliburGetRichTextSelectionState();if(!o||Date.now()-o.updatedAt>EXCALIBUR_RICH_TEXT_SELECTION_MAX_AGE)return null;let t=e.editingTextElement?.id,r=e.selectedElementIds||{};return t&&t!==o.elementId?null:!t&&Object.keys(r).length>0&&!r[o.elementId]?null:o},excaliburNormalizeTextColorRanges=(e,o)=>Array.isArray(e)?e.map(t=>({start:Math.max(0,Math.min(o,Number(t.start))),end:Math.max(0,Math.min(o,Number(t.end))),color:typeof t.color=="string"?t.color:""})).filter(t=>t.color&&Number.isFinite(t.start)&&Number.isFinite(t.end)&&t.start<t.end).sort((t,r)=>t.start-r.start||t.end-r.end):[],excaliburMergeTextColorRanges=e=>{let o=[];for(let t of e){let r=o[o.length-1];r&&r.end===t.start&&r.color===t.color?r.end=t.end:o.push({...t})}return o},excaliburApplyTextColorRange=(e,o,t,r,n)=>{let i=excaliburNormalizeTextColorRanges(e.customData?.excaliburTextColorRanges,n),a=[];for(let l of i)l.end<=o||l.start>=t?a.push(l):(l.start<o&&a.push({start:l.start,end:o,color:l.color}),l.end>t&&a.push({start:t,end:l.end,color:l.color}));return r!==e.strokeColor&&a.push({start:o,end:t,color:r}),excaliburMergeTextColorRanges(a.filter(l=>l.start<l.end).sort((l,s)=>l.start-s.start||l.end-s.end))},excaliburGetWysiwygTextColorRanges=(e,o)=>excaliburNormalizeTextColorRanges(e.customData?.excaliburTextColorRanges,tn(String(o??e.originalText??e.text??"")).length),excaliburGetWysiwygColorAtOffset=(e,o,t)=>{for(let r=e.length-1;r>=0;r--){let n=e[r];if(o>=n.start&&o<n.end)return n.color}return t},excaliburAppendWysiwygMirrorSegment=(e,o,t)=>{let r=e.ownerDocument.createElement("span");r.textContent=o,r.style.color=t,e.appendChild(r)},excaliburRenderWysiwygMirrorText=(e,o,t,r)=>{e.replaceChildren();let n=tn(String(o??""));if(!n){excaliburAppendWysiwygMirrorSegment(e,"\u200b",r);return}let i="",a=null,l=()=>{i&&(excaliburAppendWysiwygMirrorSegment(e,i,a||r),i="")};for(let s=0;s<n.length;s++){let c=n[s];if(c==="\n"){l(),e.appendChild(e.ownerDocument.createElement("br")),s===n.length-1&&excaliburAppendWysiwygMirrorSegment(e,"\u200b",r);continue}let m=excaliburGetWysiwygColorAtOffset(t,s,r);a!==m&&(l(),a=m),i+=c}l()},excaliburCreateWysiwygMirror=()=>{let e=document.createElement("div");return e.className="excalibur-rich-text-wysiwyg-mirror",Object.assign(e.style,{position:"absolute",display:"none",minHeight:"1em",backfaceVisibility:"hidden",margin:0,padding:0,border:0,outline:0,resize:"none",background:"transparent",overflow:"hidden",pointerEvents:"none",userSelect:"none",zIndex:"var(--zIndex-wysiwyg)",boxSizing:"content-box"}),e},excaliburSyncWysiwygMirror=(e,o,t,r=t)=>{let n=r||t,i=excaliburGetWysiwygTextColorRanges(n,o.value);if(o.style.caretColor=n.strokeColor,!i.length){e.style.display="none",o.style.color=n.strokeColor,o.style.webkitTextFillColor="";return}for(let a of["font","fontFamily","fontSize","fontWeight","fontStyle","lineHeight","width","height","left","top","transform","textAlign","verticalAlign","opacity","filter","maxHeight","wordBreak","whiteSpace","overflowWrap"])e.style[a]=o.style[a];e.dir=o.dir,e.style.display=o.style.display||"inline-block",e.style.color=n.strokeColor,excaliburRenderWysiwygMirrorText(e,o.value,i,n.strokeColor),o.style.color="transparent",o.style.webkitTextFillColor="transparent"},excaliburPartialTextStroke=(e,o,t,r)=>{let n=t?.currentItemStrokeColor;if(!n)return null;let i=o.editingTextElement,a=i&&Y(i)?i.id:null,l=null,s=null,c=r?.excalidrawContainerRef?.current?.querySelector("textarea.excalidraw-wysiwyg"),m=c instanceof HTMLTextAreaElement?c.dataset.excaliburElementId:null;c instanceof HTMLTextAreaElement&&(a||m)&&(a=a||m,l=excaliburRememberWysiwygSelection(a,c),s=tn(c.value));let d=excaliburGetStoredWysiwygSelection(o);if((!l||l.start===l.end||!a)&&d&&(a=d.elementId,l={start:d.start,end:d.end},s=tn(d.text??"")),!l||l.start===l.end||!a)return null;let p=e.find(u=>u.id===a);if(!p||!Y(p))return null;s=s||tn(p.originalText??p.text??"");let u=s.length,h=Math.min(l.start,u),f=Math.min(l.end,u);if(h===f)return null;let b=h===0&&f===u,x=b?[]:excaliburApplyTextColorRange(p,h,f,n,u),T={...(p.customData||{})};x.length?T.excaliburTextColorRanges=x:delete T.excaliburTextColorRanges;let w=q(p,{strokeColor:b?n:p.strokeColor,customData:T},!0);return excaliburClearRichTextSelectionState(),c instanceof HTMLTextAreaElement&&setTimeout(()=>{c.dispatchEvent(new Event("excalibur-rich-text-format-applied"))}),{elements:e.map(C=>C.id===p.id?w:C),appState:{...o,...t},captureUpdate:L.IMMEDIATELY}};`;
 
 function replaceOnce(content, search, replacement, file, label) {
   if (content.includes(replacement)) {
@@ -746,6 +865,82 @@ function patchProdRichTextStrokeHelper(content, file) {
     `${richTextStrokeProd}var U2=D({name:"changeStrokeColor"`,
     file,
     "prod partial text stroke helper",
+  );
+}
+
+function patchDevRichTextWysiwygMirror(content, file) {
+  content = replaceOnce(
+    content,
+    '      if (isTestEnv()) {\n        editable.style.fontFamily = getFontFamilyString(updatedTextElement);\n      }\n      mutateElement(updatedTextElement, { x: coordX, y: coordY });',
+    '      if (isTestEnv()) {\n        editable.style.fontFamily = getFontFamilyString(updatedTextElement);\n      }\n      syncExcaliburWysiwygMirror(excaliburWysiwygMirror, editable, element, updatedTextElement);\n      mutateElement(updatedTextElement, { x: coordX, y: coordY });',
+    file,
+    "dev rich text wysiwyg mirror sync",
+  );
+  content = replaceOnce(
+    content,
+    '  Object.assign(editable.style, {\n    position: "absolute",\n    display: "inline-block",\n    minHeight: "1em",\n    backfaceVisibility: "hidden",\n    margin: 0,\n    padding: 0,\n    border: 0,\n    outline: 0,\n    resize: "none",\n    background: "transparent",\n    overflow: "hidden",\n    // must be specified because in dark mode canvas creates a stacking context\n    zIndex: "var(--zIndex-wysiwyg)",\n    wordBreak,\n    // prevent line wrapping (`whitespace: nowrap` doesn\'t work on FF)\n    whiteSpace,\n    overflowWrap: "break-word",\n    boxSizing: "content-box"\n  });\n  editable.dataset.excaliburElementId = element.id;',
+    '  Object.assign(editable.style, {\n    position: "absolute",\n    display: "inline-block",\n    minHeight: "1em",\n    backfaceVisibility: "hidden",\n    margin: 0,\n    padding: 0,\n    border: 0,\n    outline: 0,\n    resize: "none",\n    background: "transparent",\n    overflow: "hidden",\n    // must be specified because in dark mode canvas creates a stacking context\n    zIndex: "var(--zIndex-wysiwyg)",\n    wordBreak,\n    // prevent line wrapping (`whitespace: nowrap` doesn\'t work on FF)\n    whiteSpace,\n    overflowWrap: "break-word",\n    boxSizing: "content-box"\n  });\n  const excaliburWysiwygMirror = createExcaliburWysiwygMirror();\n  editable.dataset.excaliburElementId = element.id;',
+    file,
+    "dev rich text wysiwyg mirror creation",
+  );
+  content = replaceOnce(
+    content,
+    '      onChange(editable.value);\n    };',
+    '      onChange(editable.value);\n      syncExcaliburWysiwygMirror(excaliburWysiwygMirror, editable, element);\n    };',
+    file,
+    "dev rich text wysiwyg mirror input sync",
+  );
+  content = replaceOnce(
+    content,
+    '    unbindUpdate();\n    unbindOnScroll();\n    editable.remove();',
+    '    unbindUpdate();\n    unbindOnScroll();\n    excaliburWysiwygMirror.remove();\n    editable.remove();',
+    file,
+    "dev rich text wysiwyg mirror cleanup",
+  );
+  return replaceOnce(
+    content,
+    '  excalidrawContainer?.querySelector(".excalidraw-textEditorContainer").appendChild(editable);',
+    '  const textEditorContainer = excalidrawContainer?.querySelector(".excalidraw-textEditorContainer");\n  textEditorContainer?.appendChild(excaliburWysiwygMirror);\n  textEditorContainer?.appendChild(editable);',
+    file,
+    "dev rich text wysiwyg mirror append",
+  );
+}
+
+function patchProdRichTextWysiwygMirror(content, file) {
+  content = replaceOnce(
+    content,
+    'sa()&&(d.style.fontFamily=Xr(O)),P(O,{x:ne,y:ge})',
+    'sa()&&(d.style.fontFamily=Xr(O)),excaliburSyncWysiwygMirror(excaliburWysiwygMirror,d,n,O),P(O,{x:ne,y:ge})',
+    file,
+    "prod rich text wysiwyg mirror sync",
+  );
+  content = replaceOnce(
+    content,
+    'Object.assign(d.style,{position:"absolute",display:"inline-block",minHeight:"1em",backfaceVisibility:"hidden",margin:0,padding:0,border:0,outline:0,resize:"none",background:"transparent",overflow:"hidden",zIndex:"var(--zIndex-wysiwyg)",wordBreak:u,whiteSpace:p,overflowWrap:"break-word",boxSizing:"content-box"}),d.dataset.excaliburElementId=n.id,',
+    'Object.assign(d.style,{position:"absolute",display:"inline-block",minHeight:"1em",backfaceVisibility:"hidden",margin:0,padding:0,border:0,outline:0,resize:"none",background:"transparent",overflow:"hidden",zIndex:"var(--zIndex-wysiwyg)",wordBreak:u,whiteSpace:p,overflowWrap:"break-word",boxSizing:"content-box"});let excaliburWysiwygMirror=excaliburCreateWysiwygMirror();d.dataset.excaliburElementId=n.id,',
+    file,
+    "prod rich text wysiwyg mirror creation",
+  );
+  content = replaceOnce(
+    content,
+    'if(d.value!==F){let O=d.selectionStart;d.value=F,d.selectionStart=O,d.selectionEnd=O}o(d.value)}),d.onkeydown=',
+    'if(d.value!==F){let O=d.selectionStart;d.value=F,d.selectionStart=O,d.selectionEnd=O}o(d.value),excaliburSyncWysiwygMirror(excaliburWysiwygMirror,d,n)}),d.onkeydown=',
+    file,
+    "prod rich text wysiwyg mirror input sync",
+  );
+  content = replaceOnce(
+    content,
+    'N(),G(),d.remove()},k=',
+    'N(),G(),excaliburWysiwygMirror.remove(),d.remove()},k=',
+    file,
+    "prod rich text wysiwyg mirror cleanup",
+  );
+  return replaceOnce(
+    content,
+    ',a?.querySelector(".excalidraw-textEditorContainer").appendChild(d)};var aT=',
+    ';let excaliburTextEditorContainer=a?.querySelector(".excalidraw-textEditorContainer");excaliburTextEditorContainer?.appendChild(excaliburWysiwygMirror),excaliburTextEditorContainer?.appendChild(d)};var aT=',
+    file,
+    "prod rich text wysiwyg mirror append",
   );
 }
 
@@ -948,6 +1143,7 @@ patchFile(files.devIndex, [
     '  let isDestroyed = false;\n  editable.addEventListener("excalibur-rich-text-format-applied", () => {\n    if (isDestroyed) {\n      return;\n    }\n    handleSubmit();\n  });\n  if (autoSelect) {',
   ),
   patchDevRichTextStrokeHelper,
+  patchDevRichTextWysiwygMirror,
   rep(
     '  perform: (elements, appState, value) => {\n    return {',
     '  perform: (elements, appState, value, app) => {\n    const partialTextStrokeResult = createExcaliburPartialTextStrokeResult(elements, appState, value, app);\n    if (partialTextStrokeResult) {\n      return partialTextStrokeResult;\n    }\n    return {',
@@ -996,6 +1192,7 @@ patchFile(files.prodIndex, [
     'G=l.onScrollChangeEmitter.on(()=>{m()}),H=!1;d.addEventListener("excalibur-rich-text-format-applied",()=>{H||I()}),s&&d.select(),k();',
   ),
   patchProdRichTextStrokeHelper,
+  patchProdRichTextWysiwygMirror,
   rep(
     'perform:(e,o,t)=>({...t.currentItemStrokeColor&&{elements:wt(e,o,r=>Ia(r.type)?q(r,{strokeColor:t.currentItemStrokeColor}):r,!0)},appState:{...o,...t},captureUpdate:t.currentItemStrokeColor?L.IMMEDIATELY:L.EVENTUALLY})',
     'perform:(e,o,t,r)=>excaliburPartialTextStroke(e,o,t,r)||({...t.currentItemStrokeColor&&{elements:wt(e,o,n=>Ia(n.type)?q(n,{strokeColor:t.currentItemStrokeColor}):n,!0)},appState:{...o,...t},captureUpdate:t.currentItemStrokeColor?L.IMMEDIATELY:L.EVENTUALLY})',

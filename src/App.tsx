@@ -96,7 +96,6 @@ import {
   openAttachmentFile,
   ProjectMetadata,
   resetStorageRoot,
-  saveExport,
   saveExportToPath,
   saveProject,
   setStorageRoot,
@@ -117,9 +116,9 @@ import {
   writeCollaborationDebugLog,
 } from "./collaboration";
 
-type ExportFormat = "png" | "jpeg";
+type ExportFormat = "png";
 type ExportScope = "canvas" | "area";
-type ExportDestination = "project" | "path";
+type ExportAction = "save" | "clipboard";
 type ClipboardCopyResult = "rich" | "image" | "text";
 type AppTheme = "light" | "dark";
 type ClipboardRichPart =
@@ -190,8 +189,8 @@ type CanvasRect = {
 };
 
 type AreaExportState = {
+  action: ExportAction;
   current: CanvasPoint | null;
-  destination: ExportDestination;
   format: ExportFormat;
   pointerId: number | null;
   start: CanvasPoint | null;
@@ -941,15 +940,15 @@ function getAudioContextConstructor() {
 }
 
 function getExportExtension(format: ExportFormat) {
-  return format === "png" ? "png" : "jpg";
+  return format;
 }
 
 function getExportLabel(format: ExportFormat) {
-  return format === "png" ? "PNG" : "JPG";
+  return format.toUpperCase();
 }
 
 function getExportMimeType(format: ExportFormat) {
-  return format === "png" ? "image/png" : "image/jpeg";
+  return `image/${format}`;
 }
 
 function getExportFileName(
@@ -1110,7 +1109,6 @@ async function cropCanvasToBlob({
     return await canvasToTypedBlob(
       outputCanvas,
       getExportMimeType(format),
-      format === "jpeg" ? 0.94 : undefined,
     );
   } finally {
     outputCanvas.width = 1;
@@ -1161,6 +1159,22 @@ async function writeSelectionToClipboard(
   }
 
   throw new Error("clipboard write is unavailable");
+}
+
+async function writeImageBlobToClipboard(blob: Blob) {
+  if (
+    navigator.clipboard?.write &&
+    typeof ClipboardItem !== "undefined"
+  ) {
+    await navigator.clipboard.write([
+      new ClipboardItem({
+        "image/png": blob,
+      }),
+    ]);
+    return;
+  }
+
+  throw new Error("clipboard image write is unavailable");
 }
 
 async function exportAreaToBlob({
@@ -1229,9 +1243,8 @@ async function exportAreaToBlob({
 
 function withExportPathExtension(path: string, format: ExportFormat) {
   const extension = getExportExtension(format);
-  const matchingExtension = format === "png" ? /\.png$/i : /\.(jpe?g)$/i;
 
-  if (matchingExtension.test(path)) {
+  if (/\.png$/i.test(path)) {
     return path;
   }
 
@@ -5553,34 +5566,6 @@ function App() {
           return;
         }
 
-        const exported = await saveExport(
-          payload.project.id,
-          payload.fileName,
-          payload.bytes,
-          payload.blob,
-        );
-
-        setExportedPath(exported.path);
-        setStatus("Exportado");
-      } catch (error) {
-        console.error(error);
-        setStatus("Falha ao exportar");
-      }
-    },
-    [buildExportPayload],
-  );
-
-  const handleExportToPath = useCallback(
-    async (format: ExportFormat) => {
-      setIsExportMenuOpen(false);
-
-      try {
-        const payload = await buildExportPayload(format);
-
-        if (!payload) {
-          return;
-        }
-
         let targetPath = payload.fileName;
 
         if (isTauri()) {
@@ -5615,10 +5600,31 @@ function App() {
     [buildExportPayload],
   );
 
+  const handleCopyExportToClipboard = useCallback(
+    async (format: ExportFormat) => {
+      setIsExportMenuOpen(false);
+
+      try {
+        const payload = await buildExportPayload(format);
+
+        if (!payload) {
+          return;
+        }
+
+        await writeImageBlobToClipboard(payload.blob);
+        setStatus("PNG copiado para a area de transferencia");
+      } catch (error) {
+        console.error(error);
+        setStatus("Falha ao copiar PNG");
+      }
+    },
+    [buildExportPayload],
+  );
+
   const finishAreaExport = useCallback(
     async (
       format: ExportFormat,
-      destination: ExportDestination,
+      action: ExportAction,
       areaRect: CanvasRect,
     ) => {
       try {
@@ -5628,42 +5634,35 @@ function App() {
           return;
         }
 
-        if (destination === "path") {
-          let targetPath = payload.fileName;
-
-          if (isTauri()) {
-            const selectedPath = await saveDialog({
-              defaultPath: payload.fileName,
-              filters: [
-                {
-                  name: getExportLabel(format),
-                  extensions: [getExportExtension(format)],
-                },
-              ],
-              title: `Exportar selecao ${getExportLabel(format)} para`,
-            });
-
-            if (!selectedPath) {
-              setStatus("Exportacao cancelada");
-              return;
-            }
-
-            targetPath = withExportPathExtension(selectedPath, format);
-          }
-
-          const exported = await saveExportToPath(targetPath, payload.bytes, payload.blob);
-
-          setExportedPath(exported.path);
-          setStatus("Exportado");
+        if (action === "clipboard") {
+          await writeImageBlobToClipboard(payload.blob);
+          setStatus("Selecao copiada para a area de transferencia");
           return;
         }
 
-        const exported = await saveExport(
-          payload.project.id,
-          payload.fileName,
-          payload.bytes,
-          payload.blob,
-        );
+        let targetPath = payload.fileName;
+
+        if (isTauri()) {
+          const selectedPath = await saveDialog({
+            defaultPath: payload.fileName,
+            filters: [
+              {
+                name: getExportLabel(format),
+                extensions: [getExportExtension(format)],
+              },
+            ],
+            title: `Exportar selecao ${getExportLabel(format)} para`,
+          });
+
+          if (!selectedPath) {
+            setStatus("Exportacao cancelada");
+            return;
+          }
+
+          targetPath = withExportPathExtension(selectedPath, format);
+        }
+
+        const exported = await saveExportToPath(targetPath, payload.bytes, payload.blob);
 
         setExportedPath(exported.path);
         setStatus("Exportado");
@@ -5680,7 +5679,7 @@ function App() {
   );
 
   const beginAreaExport = useCallback(
-    (format: ExportFormat, destination: ExportDestination) => {
+    (format: ExportFormat, action: ExportAction) => {
       setIsExportMenuOpen(false);
 
       if (isGuestCollaborationState(collaborationStateRef.current)) {
@@ -5695,13 +5694,17 @@ function App() {
 
       setSelectedAttachmentId(null);
       setAreaExport({
+        action,
         current: null,
-        destination,
         format,
         pointerId: null,
         start: null,
       });
-      setStatus("Arraste uma area para exportar");
+      setStatus(
+        action === "clipboard"
+          ? "Arraste uma area para copiar"
+          : "Arraste uma area para exportar",
+      );
     },
     [],
   );
@@ -5843,7 +5846,7 @@ function App() {
 
       void finishAreaExport(
         currentAreaExport.format,
-        currentAreaExport.destination,
+        currentAreaExport.action,
         sceneRect,
       );
     },
@@ -6445,17 +6448,17 @@ function App() {
                   </button>
                   <button
                     className="export-menu-item"
-                    onClick={() => void handleExport("jpeg")}
+                    onClick={() => void handleCopyExportToClipboard("png")}
                     role="menuitem"
                     type="button"
                   >
-                    <ImageDown size={15} />
-                    <span>JPG</span>
+                    <Copy size={15} />
+                    <span>Copiar PNG</span>
                   </button>
                   <div className="export-menu-divider" />
                   <button
                     className="export-menu-item"
-                    onClick={() => beginAreaExport("png", "project")}
+                    onClick={() => beginAreaExport("png", "save")}
                     role="menuitem"
                     type="button"
                   >
@@ -6464,50 +6467,12 @@ function App() {
                   </button>
                   <button
                     className="export-menu-item"
-                    onClick={() => beginAreaExport("jpeg", "project")}
+                    onClick={() => beginAreaExport("png", "clipboard")}
                     role="menuitem"
                     type="button"
                   >
-                    <ImageDown size={15} />
-                    <span>Seleção JPG</span>
-                  </button>
-                  <div className="export-menu-divider" />
-                  <button
-                    className="export-menu-item"
-                    onClick={() => void handleExportToPath("png")}
-                    role="menuitem"
-                    type="button"
-                  >
-                    <FolderOpen size={15} />
-                    <span>PNG para...</span>
-                  </button>
-                  <button
-                    className="export-menu-item"
-                    onClick={() => void handleExportToPath("jpeg")}
-                    role="menuitem"
-                    type="button"
-                  >
-                    <FolderOpen size={15} />
-                    <span>JPG para...</span>
-                  </button>
-                  <div className="export-menu-divider" />
-                  <button
-                    className="export-menu-item"
-                    onClick={() => beginAreaExport("png", "path")}
-                    role="menuitem"
-                    type="button"
-                  >
-                    <FolderOpen size={15} />
-                    <span>Seleção PNG para...</span>
-                  </button>
-                  <button
-                    className="export-menu-item"
-                    onClick={() => beginAreaExport("jpeg", "path")}
-                    role="menuitem"
-                    type="button"
-                  >
-                    <FolderOpen size={15} />
-                    <span>Seleção JPG para...</span>
+                    <Copy size={15} />
+                    <span>Copiar seleção</span>
                   </button>
                   {exportedPath ? (
                     <>
@@ -6909,7 +6874,6 @@ function App() {
                 <span>Estrutura</span>
                 <code>projects\\pasta\\canvas\\scene.excalidraw</code>
                 <code>projects\\pasta\\canvas\\exports\\png</code>
-                <code>projects\\pasta\\canvas\\exports\\jpg</code>
               </div>
 
               <div className="settings-section license-credits" style={{ borderTop: "1px solid var(--border-color)", paddingTop: "14px", marginTop: "14px" }}>

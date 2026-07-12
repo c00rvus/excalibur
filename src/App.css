@@ -1677,6 +1677,75 @@ button {
   gap: 8px;
 }
 
+.collaboration-mode-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--settings-bg) 72%, transparent);
+  padding: 4px;
+}
+
+.collaboration-mode-switch button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 30px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 16px;
+  cursor: pointer;
+}
+
+.collaboration-mode-switch button:hover:not(:disabled),
+.collaboration-mode-switch button.is-active {
+  background: var(--control-bg);
+  color: var(--fg);
+}
+
+.collaboration-mode-switch button:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+
+.collaboration-internet-config {
+  display: grid;
+  gap: 8px;
+}
+
+.collaboration-internet-config label {
+  display: grid;
+  gap: 5px;
+}
+
+.collaboration-internet-config input {
+  height: 34px;
+  min-width: 0;
+  border: 1px solid var(--control-border);
+  border-radius: 7px;
+  background: var(--settings-code-bg);
+  color: var(--fg);
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  padding: 0 10px;
+}
+
+.collaboration-internet-config textarea {
+  min-height: 66px;
+  max-height: 128px;
+}
+
+.collaboration-internet-config input:focus {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--control-border));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+  outline: none;
+}
+
 .collaboration-options {
   display: grid;
   gap: 7px;

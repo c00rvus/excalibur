@@ -42,6 +42,7 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  Globe2,
   ImageDown,
   Layers3,
   Moon,
@@ -115,12 +116,25 @@ import {
   stopCollaborationSession,
   writeCollaborationDebugLog,
 } from "./collaboration";
+import {
+  getDefaultIceServersJson,
+  isWebRtcCollaborationCode,
+  joinWebRtcCollaborationSession,
+  parseIceServers,
+  respondWebRtcCollaborationJoinRequest,
+  sendWebRtcCollaborationCursorUpdate,
+  sendWebRtcCollaborationUpdate,
+  setWebRtcCollaborationEventHandler,
+  startWebRtcCollaborationSession,
+  stopWebRtcCollaborationSession,
+} from "./webrtcCollaboration";
 
 type ExportFormat = "png";
 type ExportScope = "canvas" | "area";
 type ExportAction = "save" | "clipboard";
 type ClipboardCopyResult = "rich" | "image" | "text";
 type AppTheme = "light" | "dark";
+type CollaborationTransportMode = "lan" | "internet";
 type ClipboardRichPart =
   | {
       kind: "text";
@@ -199,6 +213,7 @@ type AreaExportState = {
 type CollaborationUiState = {
   status: "idle" | "starting" | "hosting" | "joining" | "connected" | "stopping" | "error";
   role?: CollaborationRole;
+  transport?: CollaborationTransportMode;
   sessionId?: string;
   canvasId?: string;
   peerId?: string;
@@ -243,6 +258,10 @@ const FOLDERS_STORAGE_KEY = "excalibur.folders";
 const THEME_STORAGE_KEY = "excalibur.theme";
 const LAST_LIGHT_BG_KEY = "excalibur.lastLightBg";
 const LAST_DARK_BG_KEY = "excalibur.lastDarkBg";
+const COLLABORATION_MODE_KEY = "excalibur.collaborationMode";
+const COLLABORATION_SIGNALING_URL_KEY = "excalibur.collaborationSignalingUrl";
+const COLLABORATION_ICE_SERVERS_KEY = "excalibur.collaborationIceServers";
+const DEFAULT_SIGNALING_URL = "";
 const MAX_DROPPED_ATTACHMENT_BYTES = 128 * 1024 * 1024;
 const MIN_AREA_EXPORT_SIZE = 4;
 const MAX_AREA_EXPORT_PIXELS = 48_000_000;
@@ -809,6 +828,20 @@ function groupProjects(
 
 function getStoredTheme(): AppTheme {
   return localStorage.getItem(THEME_STORAGE_KEY) === "dark" ? "dark" : "light";
+}
+
+function getStoredCollaborationMode(): CollaborationTransportMode {
+  return localStorage.getItem(COLLABORATION_MODE_KEY) === "internet"
+    ? "internet"
+    : "lan";
+}
+
+function getStoredSignalingUrl() {
+  return localStorage.getItem(COLLABORATION_SIGNALING_URL_KEY) || DEFAULT_SIGNALING_URL;
+}
+
+function getStoredIceServersJson() {
+  return localStorage.getItem(COLLABORATION_ICE_SERVERS_KEY) || getDefaultIceServersJson();
 }
 
 function getExcalidrawTheme(theme: AppTheme) {
@@ -1743,10 +1776,12 @@ function getNativePlayableAttachmentAtPoint(
 function getCollaborationStateFromInfo(
   info: CollaborationSessionInfo,
   status: CollaborationUiState["status"],
+  transport: CollaborationTransportMode = "lan",
 ): CollaborationUiState {
   return {
     status,
     role: info.role,
+    transport,
     sessionId: info.sessionId,
     canvasId: info.canvasId,
     peerId: info.peerId,
@@ -1885,6 +1920,12 @@ function App() {
   const [collaborationRequireApproval, setCollaborationRequireApproval] = useState(true);
   const [collaborationDefaultReadOnly, setCollaborationDefaultReadOnly] = useState(false);
   const [collaborationAllowGuestSaveCopy, setCollaborationAllowGuestSaveCopy] = useState(true);
+  const [collaborationMode, setCollaborationMode] =
+    useState<CollaborationTransportMode>(() => getStoredCollaborationMode());
+  const [collaborationSignalingUrl, setCollaborationSignalingUrl] =
+    useState(() => getStoredSignalingUrl());
+  const [collaborationIceServersJson, setCollaborationIceServersJson] =
+    useState(() => getStoredIceServersJson());
   const [pendingCollaborationRequests, setPendingCollaborationRequests] = useState<
     PendingCollaborationRequest[]
   >([]);
@@ -2073,6 +2114,18 @@ function App() {
   useEffect(() => {
     collaborationStateRef.current = collaboration;
   }, [collaboration]);
+
+  useEffect(() => {
+    localStorage.setItem(COLLABORATION_MODE_KEY, collaborationMode);
+  }, [collaborationMode]);
+
+  useEffect(() => {
+    localStorage.setItem(COLLABORATION_SIGNALING_URL_KEY, collaborationSignalingUrl);
+  }, [collaborationSignalingUrl]);
+
+  useEffect(() => {
+    localStorage.setItem(COLLABORATION_ICE_SERVERS_KEY, collaborationIceServersJson);
+  }, [collaborationIceServersJson]);
 
   useEffect(() => {
     if (!isExportMenuOpen) {
@@ -2494,7 +2547,11 @@ function App() {
     }
 
     try {
-      await sendCollaborationUpdate(payload);
+      if (current.transport === "internet") {
+        await sendWebRtcCollaborationUpdate(payload);
+      } else {
+        await sendCollaborationUpdate(payload);
+      }
       lastCollaborationFilesSignatureRef.current = filesSignature;
     } catch (error) {
       console.warn("Failed to send collaboration update", error);
@@ -2550,11 +2607,19 @@ function App() {
     }
 
     try {
-      await sendCollaborationCursorUpdate(
-        nextCursor.x,
-        nextCursor.y,
-        nextCursor.visible,
-      );
+      if (current.transport === "internet") {
+        await sendWebRtcCollaborationCursorUpdate(
+          nextCursor.x,
+          nextCursor.y,
+          nextCursor.visible,
+        );
+      } else {
+        await sendCollaborationCursorUpdate(
+          nextCursor.x,
+          nextCursor.y,
+          nextCursor.visible,
+        );
+      }
     } catch (error) {
       logCollaborationDebug(
         `cursor_send_error status=${current.status} role=${current.role ?? "none"} error=${error instanceof Error ? error.message : String(error)}`,
@@ -2600,7 +2665,11 @@ function App() {
     logCollaborationDebug(
       `stop_for_canvas_switch status=${current.status} role=${current.role ?? "none"}`,
     );
-    await stopCollaborationSession();
+    if (current.transport === "internet") {
+      await stopWebRtcCollaborationSession();
+    } else {
+      await stopCollaborationSession();
+    }
     lastCollaborationFilesSignatureRef.current = "";
     setPendingCollaborationRequests([]);
     setRemoteCursors([]);
@@ -3310,20 +3379,27 @@ function App() {
 
     try {
       logCollaborationDebug(
-        `start_ui_request canvas=${project.id} ${summarizeCollaborationPayload(payload)}`,
+        `start_ui_request mode=${collaborationMode} canvas=${project.id} ${summarizeCollaborationPayload(payload)}`,
       );
-      const info = await startCollaborationSession(project.id, payload, {
+      const options = {
         requireApproval: collaborationRequireApproval,
         defaultReadOnly: collaborationDefaultReadOnly,
         allowGuestSaveCopy: collaborationAllowGuestSaveCopy,
-      });
+      };
+      const info =
+        collaborationMode === "internet"
+          ? await startWebRtcCollaborationSession(project.id, payload, options, {
+              signalingUrl: collaborationSignalingUrl,
+              iceServers: parseIceServers(collaborationIceServersJson),
+            })
+          : await startCollaborationSession(project.id, payload, options);
       lastCollaborationFilesSignatureRef.current = getFilesSignature(filesRef.current);
       setPendingCollaborationRequests([]);
-      setCollaboration(getCollaborationStateFromInfo(info, "hosting"));
+      setCollaboration(getCollaborationStateFromInfo(info, "hosting", collaborationMode));
       setIsCollaborationOpen(true);
       setStatus("Colaboracao ativa");
       logCollaborationDebug(
-        `start_ui_ok session=${info.sessionId} canvas=${info.canvasId} peer=${info.peerId} endpoints=${info.endpoints.join(",")}`,
+        `start_ui_ok mode=${collaborationMode} session=${info.sessionId} canvas=${info.canvasId} peer=${info.peerId} endpoints=${info.endpoints.join(",")}`,
       );
     } catch (error) {
       console.error("Failed to start collaboration", error);
@@ -3338,7 +3414,10 @@ function App() {
   }, [
     collaborationAllowGuestSaveCopy,
     collaborationDefaultReadOnly,
+    collaborationIceServersJson,
+    collaborationMode,
     collaborationRequireApproval,
+    collaborationSignalingUrl,
     getCurrentCollaborationPayload,
   ]);
 
@@ -3370,14 +3449,21 @@ function App() {
     }));
 
     try {
-      logCollaborationDebug(`join_ui_request code_chars=${code.length}`);
-      const info = await joinCollaborationSession(code);
-      const connectedState = getCollaborationStateFromInfo(info, "connected");
+      const transport: CollaborationTransportMode = isWebRtcCollaborationCode(code)
+        ? "internet"
+        : "lan";
+      logCollaborationDebug(`join_ui_request mode=${transport} code_chars=${code.length}`);
+      const info =
+        transport === "internet"
+          ? await joinWebRtcCollaborationSession(code)
+          : await joinCollaborationSession(code);
+      const connectedState = getCollaborationStateFromInfo(info, "connected", transport);
       collaborationStateRef.current = connectedState;
       setCollaboration(connectedState);
+      setCollaborationMode(transport);
       setIsCollaborationOpen(true);
       logCollaborationDebug(
-        `join_ui_ok session=${info.sessionId} canvas=${info.canvasId} peer=${info.peerId} initial=${summarizeCollaborationPayload(info.initialPayload)}`,
+        `join_ui_ok mode=${transport} session=${info.sessionId} canvas=${info.canvasId} peer=${info.peerId} initial=${summarizeCollaborationPayload(info.initialPayload)}`,
       );
 
       if (info.initialPayload) {
@@ -3418,8 +3504,13 @@ function App() {
       clearCollaborationUpdate();
       clearInitialCollaborationApply();
       clearCollaborationCursorUpdate();
-      await stopCollaborationSession();
-      logCollaborationDebug("stop_ui_native_ok");
+      if (collaborationStateRef.current.transport === "internet") {
+        await stopWebRtcCollaborationSession();
+        logCollaborationDebug("stop_ui_webrtc_ok");
+      } else {
+        await stopCollaborationSession();
+        logCollaborationDebug("stop_ui_native_ok");
+      }
     } finally {
       lastCollaborationFilesSignatureRef.current = "";
       setCollaboration({ status: "idle" });
@@ -3497,7 +3588,15 @@ function App() {
       );
 
       try {
-        await respondCollaborationJoinRequest(request.requestId, approved, readOnly);
+        if (collaborationStateRef.current.transport === "internet") {
+          await respondWebRtcCollaborationJoinRequest(
+            request.requestId,
+            approved,
+            readOnly,
+          );
+        } else {
+          await respondCollaborationJoinRequest(request.requestId, approved, readOnly);
+        }
         setCollaboration((state) => ({
           ...state,
           message: approved
@@ -3522,20 +3621,8 @@ function App() {
     [],
   );
 
-  useEffect(() => {
-    if (!isTauri()) {
-      return;
-    }
-
-    let active = true;
-    let unlisten: (() => void) | null = null;
-
-    listen<CollaborationEvent>("collaboration-event", (event) => {
-      if (!active) {
-        return;
-      }
-
-      const payload = event.payload;
+  const handleCollaborationEvent = useCallback(
+    (payload: CollaborationEvent) => {
       if (payload.kind !== "cursorUpdate" && payload.kind !== "sceneUpdate") {
         logCollaborationDebug(
           `event_received kind=${payload.kind} role=${payload.role ?? "none"} session=${payload.sessionId ?? "none"} canvas=${payload.canvasId ?? "none"} peers=${payload.peerCount ?? "none"} message=${payload.message ?? "none"} ${summarizeCollaborationPayload(payload.payload)}`,
@@ -3655,6 +3742,24 @@ function App() {
           message: payload.message ?? "Erro na colaboracao.",
         }));
       }
+    },
+    [applyCollaborationPayload, clearActiveCanvas],
+  );
+
+  useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+
+    let active = true;
+    let unlisten: (() => void) | null = null;
+
+    listen<CollaborationEvent>("collaboration-event", (event) => {
+      if (!active) {
+        return;
+      }
+
+      handleCollaborationEvent(event.payload);
     })
       .then((fn) => {
         if (active) {
@@ -3686,13 +3791,22 @@ function App() {
         unlisten();
       }
     };
-  }, [applyCollaborationPayload, clearActiveCanvas]);
+  }, [applyCollaborationPayload, clearActiveCanvas, handleCollaborationEvent]);
+
+  useEffect(() => {
+    setWebRtcCollaborationEventHandler(handleCollaborationEvent);
+
+    return () => {
+      setWebRtcCollaborationEventHandler(null);
+    };
+  }, [handleCollaborationEvent]);
 
   useEffect(() => {
     return () => {
       logCollaborationDebug("app_cleanup_stop_collaboration");
       clearCollaborationUpdate();
       clearCollaborationCursorUpdate();
+      void stopWebRtcCollaborationSession();
       void stopCollaborationSession();
     };
   }, [clearCollaborationCursorUpdate, clearCollaborationUpdate]);
@@ -6014,6 +6128,10 @@ function App() {
     collaboration.status === "starting" ||
     collaboration.status === "joining" ||
     collaboration.status === "stopping";
+  const canStartCollaboration =
+    Boolean(activeProject) &&
+    !isCollaborationBusy &&
+    (collaborationMode !== "internet" || Boolean(collaborationSignalingUrl.trim()));
   const isAudioPlacementPending = Boolean(pendingAudioRecording);
   const isAudioRecorderVisible =
     isAudioRecorderOpen ||
@@ -6978,6 +7096,14 @@ function App() {
               {isCollaborationActive ? (
                 <div className="collaboration-security-row">
                   <span>
+                    {collaboration.transport === "internet" ? (
+                      <Globe2 size={14} />
+                    ) : (
+                      <Users size={14} />
+                    )}
+                    {collaboration.transport === "internet" ? "Internet WebRTC" : "Rede local"}
+                  </span>
+                  <span>
                     <ShieldCheck size={14} />
                     Mensagens criptografadas
                   </span>
@@ -7113,6 +7239,50 @@ function App() {
                         <span>Crie um codigo para outra pessoa entrar.</span>
                       </div>
                     </div>
+                    <div className="collaboration-mode-switch" role="group" aria-label="Modo de colaboracao">
+                      <button
+                        className={collaborationMode === "lan" ? "is-active" : ""}
+                        disabled={isCollaborationBusy}
+                        onClick={() => setCollaborationMode("lan")}
+                        type="button"
+                      >
+                        <Users size={14} />
+                        <span>LAN</span>
+                      </button>
+                      <button
+                        className={collaborationMode === "internet" ? "is-active" : ""}
+                        disabled={isCollaborationBusy}
+                        onClick={() => setCollaborationMode("internet")}
+                        type="button"
+                      >
+                        <Globe2 size={14} />
+                        <span>Internet</span>
+                      </button>
+                    </div>
+                    {collaborationMode === "internet" ? (
+                      <div className="collaboration-internet-config">
+                        <label>
+                          <span>Servidor de sinalizacao</span>
+                          <input
+                            onChange={(event) =>
+                              setCollaborationSignalingUrl(event.currentTarget.value)
+                            }
+                            placeholder="https://seu-relay.exemplo.com"
+                            value={collaborationSignalingUrl}
+                          />
+                        </label>
+                        <label>
+                          <span>STUN/TURN</span>
+                          <textarea
+                            onChange={(event) =>
+                              setCollaborationIceServersJson(event.currentTarget.value)
+                            }
+                            spellCheck={false}
+                            value={collaborationIceServersJson}
+                          />
+                        </label>
+                      </div>
+                    ) : null}
                     <div className="collaboration-options">
                       <label className="collaboration-option">
                         <input
@@ -7147,7 +7317,7 @@ function App() {
                     </div>
                     <button
                       className="toolbar-button collaboration-primary-action"
-                      disabled={!activeProject || isCollaborationBusy}
+                      disabled={!canStartCollaboration}
                       onClick={() => {
                         void handleStartCollaboration();
                       }}

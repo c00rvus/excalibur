@@ -57,6 +57,7 @@ import {
   Search,
   Settings,
   ShieldCheck,
+  Sparkles,
   Square,
   Sun,
   Trash2,
@@ -78,6 +79,23 @@ import {
   getFileNameFromPath,
   normalizeAttachments,
 } from "./attachments";
+import { duplicateNativeAttachmentRecords } from "./attachmentDuplicates";
+import {
+  collectInternalClipboardElements,
+  createClipboardContentSignature,
+  createClipboardCopyId,
+  createInternalPasteEvent,
+  embedInternalClipboardMarker,
+  getClipboardContentSignature,
+  extractInternalClipboardCopyId,
+  INTERNAL_CLIPBOARD_TTL_MS,
+  isInternalClipboardSnapshotFresh,
+  isWritableClipboardTarget,
+  serializeInternalClipboard,
+  setClipboardEventRepresentations,
+  writeAsyncClipboardRepresentations,
+  type ClipboardRepresentationPayload,
+} from "./clipboard";
 import {
   canRenderNativeAttachmentPreview,
   NativePreviewResult,
@@ -128,6 +146,21 @@ import {
   startWebRtcCollaborationSession,
   stopWebRtcCollaborationSession,
 } from "./webrtcCollaboration";
+import {
+  executeCanvasPlan,
+  serializeCanvasContext,
+  type CanvasExecutionResult,
+  type CanvasScope,
+} from "./codex";
+import {
+  CodexPanel,
+  type CodexPlanPreview,
+} from "./codex-ui/CodexPanel";
+import {
+  CodexPreviewOverlay,
+  type CodexPreviewItem,
+} from "./codex-ui/CodexPreviewOverlay";
+import { useCodexAssistant } from "./codex-ui/useCodexAssistant";
 
 type ExportFormat = "png";
 type ExportScope = "canvas" | "area";
@@ -290,6 +323,30 @@ type SceneViewport = {
   zoom: number;
   offsetLeft: number;
   offsetTop: number;
+};
+
+type CodexSourceSnapshot = {
+  allowedElementIds: ReadonlySet<string>;
+  canvasId: string;
+  elements: readonly ExcalidrawElement[];
+  files: BinaryFiles;
+  signature: string;
+};
+
+type CodexExecutionPreview = {
+  canvasId: string;
+  result: CanvasExecutionResult;
+  sourceElements: readonly ExcalidrawElement[];
+  sourceFiles: BinaryFiles;
+  sourceSignature: string;
+};
+
+type CodexUndoSnapshot = {
+  afterSignature: string;
+  beforeElements: readonly ExcalidrawElement[];
+  beforeFiles: BinaryFiles;
+  canvasId: string;
+  selectedElementIds: Readonly<Record<string, true>>;
 };
 
 type AppStateWithViewportOffset = Partial<AppState> & {
@@ -1292,11 +1349,12 @@ function getCanvasPayload(
   options: { includeFiles?: boolean } = {},
 ) {
   const includeFiles = options.includeFiles ?? true;
+  const referencedFiles = getReferencedBinaryFiles(elements, files);
   const payload = JSON.parse(
     serializeAsJSON(
       elements,
       getCleanAppState(appState),
-      includeFiles ? files : EMPTY_FILES,
+      includeFiles ? referencedFiles : EMPTY_FILES,
       "local",
     ),
   );
@@ -1308,6 +1366,26 @@ function getCanvasPayload(
   payload[ATTACHMENTS_PAYLOAD_KEY] = attachments;
 
   return JSON.stringify(payload);
+}
+
+function getReferencedBinaryFiles(
+  elements: readonly ExcalidrawElement[],
+  files: BinaryFiles,
+): BinaryFiles {
+  const referencedFileIds = new Set<FileId>();
+  for (const element of elements) {
+    if (element.isDeleted || element.type !== "image" || !element.fileId) {
+      continue;
+    }
+    referencedFileIds.add(element.fileId);
+  }
+
+  return Object.fromEntries(
+    [...referencedFileIds].flatMap((fileId) => {
+      const file = files[fileId];
+      return file ? [[fileId, file]] : [];
+    }),
+  ) as BinaryFiles;
 }
 
 function getFilesSignature(files: BinaryFiles) {
@@ -1480,6 +1558,16 @@ function getChangedElementIds(
   });
 
   return changedIds;
+}
+
+function getCodexSceneSignature(elements: readonly ExcalidrawElement[]) {
+  return elements
+    .map(
+      (element) =>
+        `${element.id}:${element.version}:${element.versionNonce}:${element.isDeleted ? 1 : 0}`,
+    )
+    .sort()
+    .join("|");
 }
 
 function getRemoteCursorColor(peerId: string) {
@@ -1838,6 +1926,14 @@ function App() {
   const filesRef = useRef<BinaryFiles>(EMPTY_FILES);
   const attachmentsRef = useRef<CanvasAttachment[]>([]);
   const canvasHostRef = useRef<HTMLDivElement | null>(null);
+  const internalClipboardRef = useRef<{
+    allowedContentSignatures: string[];
+    copyId: string;
+    createdAt: number;
+    json: string;
+    nativeAttachments: CanvasAttachment[];
+  } | null>(null);
+  const internalClipboardExpiryTimerRef = useRef<number | null>(null);
   const exportMenuRef = useRef<HTMLDivElement | null>(null);
   const autoSaveTimerRef = useRef<number | null>(null);
   const collaborationUpdateTimerRef = useRef<number | null>(null);
@@ -1874,6 +1970,8 @@ function App() {
   const lastCollaborationSceneSentAtRef = useRef(0);
   const applyingRemoteSceneRef = useRef(false);
   const collaborationStateRef = useRef<CollaborationUiState>({ status: "idle" });
+  const codexSourceSnapshotRef = useRef<CodexSourceSnapshot | null>(null);
+  const codexTriggerRef = useRef<HTMLButtonElement | null>(null);
   const pendingCursorUpdateRef = useRef<{
     x: number;
     y: number;
@@ -1908,6 +2006,13 @@ function App() {
   const [isDirty, setIsDirty] = useState(false);
   const [isSidebarCompact, setIsSidebarCompact] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isCodexOpen, setIsCodexOpen] = useState(false);
+  const [codexFocusRequest, setCodexFocusRequest] = useState(0);
+  const [codexExecution, setCodexExecution] =
+    useState<CodexExecutionPreview | null>(null);
+  const [codexExecutionError, setCodexExecutionError] = useState<string | null>(null);
+  const [codexUndoSnapshot, setCodexUndoSnapshot] =
+    useState<CodexUndoSnapshot | null>(null);
   const [status, setStatus] = useState("Carregando canvas");
   const [exportedPath, setExportedPath] = useState<string | null>(null);
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
@@ -2954,6 +3059,10 @@ function App() {
         window.clearTimeout(copyFeedbackTimerRef.current);
         copyFeedbackTimerRef.current = null;
       }
+      if (internalClipboardExpiryTimerRef.current) {
+        window.clearTimeout(internalClipboardExpiryTimerRef.current);
+        internalClipboardExpiryTimerRef.current = null;
+      }
       if (remoteApplyTimerRef.current) {
         window.clearTimeout(remoteApplyTimerRef.current);
         remoteApplyTimerRef.current = null;
@@ -2965,6 +3074,37 @@ function App() {
     clearCollaborationUpdate,
     clearInitialCollaborationApply,
   ]);
+
+  const handleCanvasDuplicate = useCallback(
+    (
+      nextElements: readonly ExcalidrawElement[],
+      previousElements: readonly ExcalidrawElement[],
+    ) => {
+      const internalClipboard = internalClipboardRef.current;
+      const clipboardAttachmentSources =
+        internalClipboard &&
+        isInternalClipboardSnapshotFresh(internalClipboard.createdAt)
+          ? internalClipboard.nativeAttachments
+          : [];
+      const duplicateResult = duplicateNativeAttachmentRecords(
+        nextElements,
+        previousElements,
+        attachmentsRef.current,
+        undefined,
+        undefined,
+        clipboardAttachmentSources,
+      );
+
+      if (!duplicateResult) {
+        return;
+      }
+
+      attachmentsRef.current = duplicateResult.attachments;
+      setAttachments(duplicateResult.attachments);
+      return duplicateResult.elements;
+    },
+    [],
+  );
 
   const handleCanvasChange = useCallback(
     (
@@ -3055,7 +3195,7 @@ function App() {
           const api = excalidrawApiRef.current;
           elementsRef.current = previousElements;
           appStateRef.current = themedAppState;
-          filesRef.current = files;
+          filesRef.current = getReferencedBinaryFiles(previousElements, files);
           syncSceneViewport(themedAppState);
 
           if (api) {
@@ -3077,7 +3217,7 @@ function App() {
 
       elementsRef.current = elements;
       appStateRef.current = themedAppState;
-      filesRef.current = files;
+      filesRef.current = getReferencedBinaryFiles(elements, files);
       syncSceneViewport(themedAppState);
 
       const isThemeBackgroundSyncing = Date.now() < themeBackgroundSyncUntilRef.current;
@@ -5501,6 +5641,270 @@ function App() {
     setAppTheme((current) => (current === "dark" ? "light" : "dark"));
   }, []);
 
+  const handleCanvasCopyCapture = useCallback(
+    (event: React.ClipboardEvent<HTMLDivElement>) => {
+      const host = canvasHostRef.current;
+      const activeElement = document.activeElement;
+
+      if (
+        !host ||
+        !activeElement ||
+        !host.contains(activeElement) ||
+        isWritableClipboardTarget(event.target) ||
+        isWritableClipboardTarget(activeElement)
+      ) {
+        return;
+      }
+
+      const api = excalidrawApiRef.current;
+      const appState = api?.getAppState() ?? appStateRef.current;
+      const sceneElements = api?.getSceneElements() ?? elementsRef.current;
+
+      if (!activeProjectRef.current || !appState) {
+        return;
+      }
+
+      const currentCollaboration = collaborationStateRef.current;
+      if (
+        isGuestCollaborationState(currentCollaboration) &&
+        !currentCollaboration.allowGuestSaveCopy
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.nativeEvent.stopImmediatePropagation();
+        setStatus("Copia desativada pelo anfitriao");
+        return;
+      }
+
+      const selectedElements = collectInternalClipboardElements(
+        sceneElements,
+        appState.selectedElementIds ?? {},
+      );
+
+      if (!selectedElements.length) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.nativeEvent.stopImmediatePropagation();
+
+      const internalSnapshot = serializeInternalClipboard(
+        selectedElements,
+        filesRef.current,
+      );
+      const copyId = createClipboardCopyId();
+      const copyableSelectedElements = internalSnapshot.elements.filter(
+        (element) => !isNativeAudioElement(element),
+      );
+      const orderedClipboardParts = getOrderedClipboardParts(
+        copyableSelectedElements,
+        filesRef.current,
+      );
+      const plainText = getClipboardPlainText(orderedClipboardParts);
+      const hasText = orderedClipboardParts.some((part) => part.kind === "text");
+      const hasImage = orderedClipboardParts.some((part) => part.kind === "image");
+      const shouldCopyRichContent = hasText && hasImage;
+      const shouldCopyImageBlob =
+        copyableSelectedElements.length > 0 && !shouldCopyRichContent && !hasText;
+      const backgroundColor =
+        appState.viewBackgroundColor || getCanvasBackground(appTheme);
+      const imageBlob = shouldCopyImageBlob
+        ? exportToBlob({
+            elements: copyableSelectedElements,
+            appState: {
+              ...getCleanAppState(appState),
+              exportBackground: true,
+              exportEmbedScene: false,
+              viewBackgroundColor: backgroundColor,
+            },
+            files: filesRef.current,
+            mimeType: "image/png",
+            exportPadding: 16,
+          })
+        : null;
+      const clipboardHtml = embedInternalClipboardMarker(
+        orderedClipboardParts.length
+          ? getClipboardHtml(orderedClipboardParts)
+          : "",
+        copyId,
+      );
+      const payload: ClipboardRepresentationPayload = {
+        copyId,
+        html: clipboardHtml,
+        imageBlob,
+        onResolvedHtml: (resolvedHtml) => {
+          const currentClipboard = internalClipboardRef.current;
+          if (!currentClipboard || currentClipboard.copyId !== copyId) {
+            return;
+          }
+
+          const resolvedSignature = createClipboardContentSignature(
+            plainText,
+            resolvedHtml,
+          );
+          if (currentClipboard.allowedContentSignatures.includes(resolvedSignature)) {
+            return;
+          }
+
+          internalClipboardRef.current = {
+            ...currentClipboard,
+            allowedContentSignatures: [
+              ...currentClipboard.allowedContentSignatures,
+              resolvedSignature,
+            ],
+          };
+        },
+        plainText,
+        renderImageBlobInHtml: shouldCopyImageBlob,
+      };
+      const initialContentSignatures = [
+        createClipboardContentSignature(plainText, clipboardHtml),
+      ];
+      if (hasText && !hasImage) {
+        // Some WebViews preserve the custom MIME while omitting text/html.
+        initialContentSignatures.push(
+          createClipboardContentSignature(plainText, ""),
+        );
+      }
+      const copiedAttachmentIds = new Set(
+        internalSnapshot.elements
+          .map((element) => getExcaliburAttachmentElementData(element)?.attachmentId)
+          .filter((attachmentId): attachmentId is string => Boolean(attachmentId)),
+      );
+      const copiedNativeAttachments = attachmentsRef.current
+        .filter(
+          (attachment) =>
+            attachment.displayMode === "native" &&
+            copiedAttachmentIds.has(attachment.id),
+        )
+        .map((attachment) => ({
+          ...attachment,
+          nativeElementIds: attachment.nativeElementIds
+            ? [...attachment.nativeElementIds]
+            : undefined,
+        }));
+      internalClipboardRef.current = {
+        allowedContentSignatures: [...new Set(initialContentSignatures)],
+        copyId,
+        createdAt: Date.now(),
+        json: internalSnapshot.json,
+        nativeAttachments: copiedNativeAttachments,
+      };
+      if (internalClipboardExpiryTimerRef.current) {
+        window.clearTimeout(internalClipboardExpiryTimerRef.current);
+      }
+      internalClipboardExpiryTimerRef.current = window.setTimeout(() => {
+        if (internalClipboardRef.current?.copyId === copyId) {
+          internalClipboardRef.current = null;
+        }
+        internalClipboardExpiryTimerRef.current = null;
+      }, INTERNAL_CLIPBOARD_TTL_MS);
+
+      try {
+        setClipboardEventRepresentations(event.clipboardData, payload);
+      } catch (error) {
+        console.warn("Clipboard event representations were unavailable", error);
+      }
+
+      if (imageBlob) {
+        void writeAsyncClipboardRepresentations(payload)
+          .then((written) => {
+            if (!written) {
+              setStatus("Falha ao copiar selecao como imagem");
+            }
+          })
+          .catch((error) => {
+            console.warn("Async clipboard representations were unavailable", error);
+            setStatus("Falha ao copiar selecao como imagem");
+          });
+      }
+
+      if (copyFeedbackTimerRef.current) {
+        window.clearTimeout(copyFeedbackTimerRef.current);
+      }
+
+      const result: ClipboardCopyResult = shouldCopyRichContent
+        ? "rich"
+        : shouldCopyImageBlob
+          ? "image"
+          : "text";
+      setCopyFeedback(result);
+      copyFeedbackTimerRef.current = window.setTimeout(() => {
+        setCopyFeedback(null);
+        copyFeedbackTimerRef.current = null;
+      }, 1300);
+      setStatus(
+        shouldCopyRichContent
+          ? "Texto e imagens copiados"
+          : shouldCopyImageBlob
+            ? "Selecao copiada como imagem"
+            : plainText
+              ? "Texto copiado"
+              : "Elementos copiados",
+      );
+    },
+    [appTheme],
+  );
+
+  const handleCanvasPasteCapture = useCallback(
+    (event: React.ClipboardEvent<HTMLDivElement>) => {
+      if (
+        isWritableClipboardTarget(event.target) ||
+        isWritableClipboardTarget(document.activeElement)
+      ) {
+        return;
+      }
+
+      const copyId = extractInternalClipboardCopyId(event.clipboardData);
+      const internalClipboard = internalClipboardRef.current;
+
+      if (
+        !copyId ||
+        !internalClipboard ||
+        copyId !== internalClipboard.copyId
+      ) {
+        return;
+      }
+
+      if (!isInternalClipboardSnapshotFresh(internalClipboard.createdAt)) {
+        internalClipboardRef.current = null;
+        if (internalClipboardExpiryTimerRef.current) {
+          window.clearTimeout(internalClipboardExpiryTimerRef.current);
+          internalClipboardExpiryTimerRef.current = null;
+        }
+        return;
+      }
+
+      const contentSignature = getClipboardContentSignature(event.clipboardData);
+      if (
+        !contentSignature ||
+        !internalClipboard.allowedContentSignatures.includes(contentSignature)
+      ) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.nativeEvent.stopImmediatePropagation();
+
+      if (collaborationStateRef.current.readOnly) {
+        setStatus("Canvas somente leitura");
+        return;
+      }
+
+      window.setTimeout(() => {
+        try {
+          document.dispatchEvent(createInternalPasteEvent(internalClipboard.json));
+        } catch (error) {
+          console.error("Failed to restore internal clipboard elements", error);
+          setStatus("Falha ao colar elementos");
+        }
+      }, 0);
+    },
+    [],
+  );
+
   const handleCopySelection = useCallback(async () => {
     const api = excalidrawApiRef.current;
     const appState = api?.getAppState() ?? appStateRef.current;
@@ -6092,6 +6496,326 @@ function App() {
     }
   }, [storageSettings?.storageRoot]);
 
+  const isReadOnlyCollaboration =
+    collaboration.role === "guest" &&
+    collaboration.status === "connected" &&
+    Boolean(collaboration.readOnly);
+
+  const getCodexContext = useCallback((scope: CanvasScope) => {
+    const canvasId = activeProjectRef.current?.id;
+    if (!canvasId) {
+      return null;
+    }
+
+    const api = excalidrawApiRef.current;
+    const elements = api?.getSceneElementsIncludingDeleted() ?? elementsRef.current;
+    const appState = api?.getAppState() ?? appStateRef.current;
+    const context = serializeCanvasContext({
+      elements,
+      appState,
+      scope,
+      maxElements: 300,
+      maxTextLength: 800,
+    });
+
+    codexSourceSnapshotRef.current = {
+      allowedElementIds: new Set(context.elements.map((element) => element.id)),
+      canvasId,
+      elements: [...elements],
+      files: { ...filesRef.current },
+      signature: getCodexSceneSignature(elements),
+    };
+
+    return context;
+  }, []);
+
+  const codex = useCodexAssistant({
+    active: isCodexOpen,
+    canvasId: activeProject?.id ?? null,
+    projectTitle: activeProject?.title ?? "",
+    getContext: getCodexContext,
+  });
+
+  useEffect(() => {
+    codexSourceSnapshotRef.current = null;
+    setCodexExecution(null);
+    setCodexExecutionError(null);
+    setCodexUndoSnapshot(null);
+  }, [activeProject?.id]);
+
+  useEffect(() => {
+    if (!codex.plan) {
+      setCodexExecution(null);
+      return;
+    }
+
+    const source = codexSourceSnapshotRef.current;
+    const api = excalidrawApiRef.current;
+    const currentElements = api?.getSceneElementsIncludingDeleted() ?? elementsRef.current;
+
+    if (
+      !source ||
+      source.canvasId !== activeProjectRef.current?.id ||
+      source.signature !== getCodexSceneSignature(currentElements)
+    ) {
+      setCodexExecution(null);
+      setCodexExecutionError(
+        "O canvas mudou enquanto o Codex preparava a alteração. Envie a solicitação novamente.",
+      );
+      codex.clearPlan("Canvas alterado");
+      return;
+    }
+
+    try {
+      const result = executeCanvasPlan(source.elements, codex.plan, {
+        allowedElementIds: source.allowedElementIds,
+        generatedImages: codex.generatedImages,
+        readOnly: isReadOnlyCollaboration,
+      });
+      setCodexExecution({
+        canvasId: source.canvasId,
+        result,
+        sourceElements: source.elements,
+        sourceFiles: source.files,
+        sourceSignature: source.signature,
+      });
+      setCodexExecutionError(null);
+    } catch (error) {
+      setCodexExecution(null);
+      setCodexExecutionError(
+        error instanceof Error ? error.message : "O plano do Codex não é válido.",
+      );
+      codex.clearPlan("Plano inválido");
+    }
+  }, [
+    activeProject?.id,
+    codex.clearPlan,
+    codex.generatedImages,
+    codex.plan,
+    isReadOnlyCollaboration,
+  ]);
+
+  const codexPreviewItems = useMemo<CodexPreviewItem[]>(() => {
+    if (!codexExecution) {
+      return [];
+    }
+
+    const resultById = new Map(
+      codexExecution.result.elements.map((element) => [element.id, element]),
+    );
+    const resultFiles = {
+      ...codexExecution.sourceFiles,
+      ...Object.fromEntries(
+        codexExecution.result.files.map((file) => [file.id, file]),
+      ),
+    } as BinaryFiles;
+    const sourceById = new Map(
+      codexExecution.sourceElements.map((element) => [element.id, element]),
+    );
+
+    return [
+      ...codexExecution.result.createdElementIds.flatMap((id) => {
+        const element = resultById.get(id);
+        return element && !element.isDeleted
+          ? [{
+              dataURL:
+                element.type === "image" && element.fileId
+                  ? resultFiles[element.fileId]?.dataURL
+                  : undefined,
+              element,
+              kind: "created" as const,
+            }]
+          : [];
+      }),
+      ...codexExecution.result.updatedElementIds.flatMap((id) => {
+        const element = resultById.get(id);
+        return element && !element.isDeleted
+          ? [{
+              dataURL:
+                element.type === "image" && element.fileId
+                  ? resultFiles[element.fileId]?.dataURL
+                  : undefined,
+              element,
+              kind: "updated" as const,
+            }]
+          : [];
+      }),
+      ...codexExecution.result.deletedElementIds.flatMap((id) => {
+        const element = sourceById.get(id);
+        return element && !element.isDeleted
+          ? [{
+              dataURL:
+                element.type === "image" && element.fileId
+                  ? codexExecution.sourceFiles[element.fileId]?.dataURL
+                  : undefined,
+              element,
+              kind: "deleted" as const,
+            }]
+          : [];
+      }),
+    ];
+  }, [codexExecution]);
+
+  const codexPlanPreview = useMemo<CodexPlanPreview | null>(() => {
+    if (!codex.plan || !codexExecution) {
+      return null;
+    }
+
+    return {
+      summary: codex.plan.summary,
+      operationCount: codex.plan.commands.length,
+      affectedCount: codexExecution.result.affectedElementIds.length,
+      createdCount: codexExecution.result.createdElementIds.length,
+      deletedCount: codexExecution.result.deletedElementIds.length,
+    };
+  }, [codex.plan, codexExecution]);
+
+  const cancelCodexPlan = useCallback(() => {
+    setCodexExecution(null);
+    setCodexExecutionError(null);
+    codex.clearPlan("Cancelado");
+  }, [codex.clearPlan]);
+
+  const submitCodexRequest = useCallback(
+    (prompt: string) => {
+      setCodexExecution(null);
+      setCodexExecutionError(null);
+      void codex.submit(prompt);
+    },
+    [codex.submit],
+  );
+
+  const applyCodexPlan = useCallback(() => {
+    const execution = codexExecution;
+    const api = excalidrawApiRef.current;
+    const canvasId = activeProjectRef.current?.id;
+
+    if (!execution || !api || !canvasId || execution.canvasId !== canvasId) {
+      return;
+    }
+    if (isReadOnlyCollaboration) {
+      setCodexExecutionError("O canvas está em modo somente visualização.");
+      return;
+    }
+
+    const currentElements = api.getSceneElementsIncludingDeleted();
+    if (getCodexSceneSignature(currentElements) !== execution.sourceSignature) {
+      setCodexExecution(null);
+      setCodexExecutionError(
+        "O canvas mudou depois da prévia. Envie a solicitação novamente.",
+      );
+      codex.clearPlan("Canvas alterado");
+      return;
+    }
+
+    const selectedElementIds = Object.fromEntries(
+      execution.result.affectedElementIds
+        .filter((id) =>
+          execution.result.elements.some((element) => element.id === id && !element.isDeleted),
+        )
+        .map((id) => [id, true]),
+    ) as Record<string, true>;
+    const previousSelectedElementIds = {
+      ...(api.getAppState().selectedElementIds ?? {}),
+    } as Record<string, true>;
+
+    if (execution.result.files.length) {
+      api.addFiles([...execution.result.files]);
+    }
+    const nextFiles = {
+      ...filesRef.current,
+      ...Object.fromEntries(execution.result.files.map((file) => [file.id, file])),
+    } as BinaryFiles;
+
+    api.updateScene({
+      elements: execution.result.elements,
+      appState: { selectedElementIds },
+      captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+    });
+    api.refresh();
+    elementsRef.current = execution.result.elements;
+    filesRef.current = getReferencedBinaryFiles(execution.result.elements, nextFiles);
+    setCodexUndoSnapshot({
+      afterSignature: getCodexSceneSignature(execution.result.elements),
+      beforeElements: execution.sourceElements,
+      beforeFiles: execution.sourceFiles,
+      canvasId,
+      selectedElementIds: previousSelectedElementIds,
+    });
+    setCodexExecution(null);
+    setCodexExecutionError(null);
+    codex.clearPlan("Aplicado");
+    setStatus("Alteração do Codex aplicada");
+  }, [codex.clearPlan, codexExecution, isReadOnlyCollaboration]);
+
+  const canUndoCodex = Boolean(
+    codexUndoSnapshot &&
+      codexUndoSnapshot.canvasId === activeProject?.id &&
+      codexUndoSnapshot.afterSignature ===
+        getCodexSceneSignature(
+          excalidrawApiRef.current?.getSceneElementsIncludingDeleted() ?? elementsRef.current,
+        ),
+  );
+
+  const undoCodexPlan = useCallback(() => {
+    const snapshot = codexUndoSnapshot;
+    const api = excalidrawApiRef.current;
+    if (!snapshot || !api || snapshot.canvasId !== activeProjectRef.current?.id) {
+      return;
+    }
+    if (
+      snapshot.afterSignature !== getCodexSceneSignature(api.getSceneElementsIncludingDeleted())
+    ) {
+      setCodexUndoSnapshot(null);
+      setCodexExecutionError(
+        "O canvas mudou depois da aplicação; use o histórico normal do canvas.",
+      );
+      return;
+    }
+
+    api.updateScene({
+      elements: snapshot.beforeElements,
+      appState: { selectedElementIds: { ...snapshot.selectedElementIds } },
+      captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+    });
+    api.refresh();
+    elementsRef.current = snapshot.beforeElements;
+    filesRef.current = snapshot.beforeFiles;
+    setCodexUndoSnapshot(null);
+    setCodexExecutionError(null);
+    setStatus("Alteração do Codex desfeita");
+  }, [codexUndoSnapshot]);
+
+  const openCodex = useCallback(() => {
+    if (!isCodexOpen) {
+      if (!codex.busy && !codex.plan) {
+        codex.setScope(selectedElementCount > 0 ? "selection" : "viewport");
+      }
+      setIsCodexOpen(true);
+    }
+    setCodexFocusRequest((value) => value + 1);
+  }, [codex.busy, codex.plan, codex.setScope, isCodexOpen, selectedElementCount]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.key.toLowerCase() !== "k" ||
+        (!event.ctrlKey && !event.metaKey) ||
+        event.altKey ||
+        isEditableKeyboardTarget(event.target)
+      ) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      openCodex();
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [openCodex]);
+
   const pendingAttachmentName = pendingAttachment?.name ?? "";
   const pendingAttachmentExtension = pendingAttachment
     ? getExtensionFromPath(pendingAttachment.name)
@@ -6110,10 +6834,6 @@ function App() {
     collaboration.role === "guest" && collaboration.status === "connected";
   const canGuestSaveCopy =
     isGuestCollaboration && Boolean(collaboration.allowGuestSaveCopy);
-  const isReadOnlyCollaboration =
-    collaboration.role === "guest" &&
-    collaboration.status === "connected" &&
-    Boolean(collaboration.readOnly);
   const canSaveProject =
     Boolean(activeProject) && (!isGuestCollaboration || canGuestSaveCopy);
   const canCopySelection =
@@ -6453,7 +7173,7 @@ function App() {
         )}
       </aside>
 
-      <section className="workspace">
+      <section className={`workspace ${isCodexOpen ? "codex-open" : ""}`}>
         <header className="topbar">
           <div className="title-cluster">
             {activeProject ? (
@@ -6528,6 +7248,18 @@ function App() {
             >
               <Paperclip size={16} />
               <span>Anexar</span>
+            </button>
+            <button
+              aria-controls="codex-assistant-panel"
+              aria-expanded={isCodexOpen}
+              aria-label="Abrir assistente de IA"
+              className={`toolbar-button codex-trigger ${isCodexOpen ? "is-active" : ""}`}
+              onClick={openCodex}
+              ref={codexTriggerRef}
+              title="Abrir assistente de IA (Ctrl+K)"
+              type="button"
+            >
+              <Sparkles size={16} />
             </button>
             <button
               className={`toolbar-button collaboration-trigger ${
@@ -6626,10 +7358,12 @@ function App() {
 
         <div
           className={`canvas-host ${isAudioPlacementPending ? "is-placing-audio" : ""}`}
+          onCopyCapture={handleCanvasCopyCapture}
           onDoubleClickCapture={handleCanvasDoubleClick}
           onDragEnterCapture={handleCanvasFileDrag}
           onDragOverCapture={handleCanvasFileDrag}
           onDropCapture={handleCanvasFileDrop}
+          onPasteCapture={handleCanvasPasteCapture}
           onPointerDownCapture={handleCanvasPointerDownCapture}
           onPointerLeave={handleCanvasPointerLeaveCapture}
           onPointerMoveCapture={handleCanvasPointerMoveCapture}
@@ -6660,6 +7394,7 @@ function App() {
                 langCode="pt-BR"
                 name={activeProject.title}
                 onChange={handleCanvasChange}
+                onDuplicate={handleCanvasDuplicate}
                 theme={getExcalidrawTheme(appTheme)}
                 viewModeEnabled={isReadOnlyCollaboration}
                 UIOptions={{
@@ -6682,6 +7417,13 @@ function App() {
               >
                 <ExcaliburMainMenu />
               </Excalidraw>
+              {isCodexOpen && codexPreviewItems.length ? (
+                <CodexPreviewOverlay
+                  host={canvasHostRef.current}
+                  items={codexPreviewItems}
+                  viewport={sceneViewport}
+                />
+              ) : null}
               {isAudioRecorderVisible ? (
                 <section
                   aria-label="Gravador de audio"
@@ -6924,6 +7666,56 @@ function App() {
             </div>
           )}
         </div>
+        {isCodexOpen ? (
+          <CodexPanel
+            account={codex.account}
+            activeProvider={codex.activeProvider}
+            activeProject={Boolean(activeProject)}
+            authDiscoveryComplete={codex.authDiscoveryComplete}
+            authDiscoveryRevision={codex.authDiscoveryRevision}
+            busy={codex.busy}
+            canUndo={canUndoCodex}
+            deviceLogin={codex.deviceLogin}
+            error={codexExecutionError || codex.error}
+            focusRequest={codexFocusRequest}
+            initializing={codex.initializing}
+            loginPending={codex.loginPending}
+            messages={codex.messages}
+            onApplyPlan={applyCodexPlan}
+            onCancelPlan={cancelCodexPlan}
+            onCancelLogin={() => void codex.cancelLogin()}
+            onClose={() => {
+              setIsCodexOpen(false);
+              window.requestAnimationFrame(() => codexTriggerRef.current?.focus());
+            }}
+            onDeviceLogin={() => void codex.loginWithDeviceCode()}
+            onInterrupt={codex.interrupt}
+            onLogin={() => void codex.login()}
+            onLogout={() => void codex.logout()}
+            onOpenDeviceLoginUrl={codex.openDeviceLoginUrl}
+            onProviderChange={codex.setProvider}
+            onProviderModelChange={codex.setProviderModel}
+            onProviderReasoningEffortChange={codex.setProviderReasoningEffort}
+            onRemoveApiKey={codex.removeProviderApiKey}
+            onRetryRuntime={() => void codex.initialize()}
+            onSaveApiKey={codex.saveProviderApiKey}
+            onScopeChange={codex.setScope}
+            onSubmit={submitCodexRequest}
+            onTestProvider={codex.testProviderConnection}
+            onUndo={undoCodexPlan}
+            plan={codexPlanPreview}
+            providerConnections={codex.providerConnections}
+            providerError={codex.providerError}
+            providerModel={codex.providerModel}
+            providerReasoningEffort={codex.providerReasoningEffort}
+            providerSettingsBusy={codex.providerSettingsBusy}
+            readOnly={isReadOnlyCollaboration}
+            runtimeReady={codex.runtimeReady}
+            scope={codex.scope}
+            selectedElementCount={selectedElementCount}
+            status={codex.status}
+          />
+        ) : null}
       </section>
 
       {isSettingsOpen ? (

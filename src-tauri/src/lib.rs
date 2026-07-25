@@ -1,4 +1,7 @@
+mod ai_providers;
+mod codex;
 mod collaboration;
+mod credentials;
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -149,6 +152,12 @@ fn storage_root(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn ensure_storage_root(root: &Path) -> Result<(), String> {
     fs::create_dir_all(projects_dir(root)).map_err(|error| error.to_string())
+}
+
+fn allow_storage_assets(app: &AppHandle, root: &Path) -> Result<(), String> {
+    app.asset_protocol_scope()
+        .allow_directory(projects_dir(root), true)
+        .map_err(|error| error.to_string())
 }
 
 fn projects_dir(root: &Path) -> PathBuf {
@@ -665,6 +674,7 @@ fn get_storage_settings(app: AppHandle) -> Result<StorageSettings, String> {
     let default_root = default_storage_root(&app)?;
 
     ensure_storage_root(&root)?;
+    allow_storage_assets(&app, &root)?;
 
     Ok(StorageSettings {
         storage_root: root.to_string_lossy().to_string(),
@@ -682,6 +692,7 @@ fn set_storage_root(app: AppHandle, path: String) -> Result<StorageSettings, Str
 
     let root = PathBuf::from(trimmed);
     ensure_storage_root(&root)?;
+    allow_storage_assets(&app, &root)?;
     write_stored_settings(
         &app,
         &StoredSettings {
@@ -695,6 +706,9 @@ fn set_storage_root(app: AppHandle, path: String) -> Result<StorageSettings, Str
 #[tauri::command]
 fn reset_storage_root(app: AppHandle) -> Result<StorageSettings, String> {
     write_stored_settings(&app, &StoredSettings::default())?;
+    let root = default_storage_root(&app)?;
+    ensure_storage_root(&root)?;
+    allow_storage_assets(&app, &root)?;
     get_storage_settings(app)
 }
 
@@ -1339,17 +1353,43 @@ fn set_titlebar_color(window: tauri::Window, theme: String) -> Result<(), String
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(ai_providers::AiProviderRuntime::default())
         .manage(collaboration::CollaborationManager::default())
+        .manage(codex::CodexBridge::new())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            // A temporarily unavailable external storage root must not prevent
+            // the application (or ChatGPT authentication) from opening. The
+            // normal storage commands surface the actionable error later.
+            if let Ok(root) = storage_root(app.handle()) {
+                if ensure_storage_root(&root).is_ok() {
+                    allow_storage_assets(app.handle(), &root).map_err(std::io::Error::other)?;
+                }
+            }
+            Ok(())
+        })
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                 window
                     .state::<collaboration::CollaborationManager>()
                     .stop("Colaboracao encerrada.");
+                let codex = window.state::<codex::CodexBridge>().inner().clone();
+                let app = window.app_handle().clone();
+                let _ = std::thread::Builder::new()
+                    .name("codex-close".to_string())
+                    .spawn(move || {
+                        let _ = codex.shutdown(&app);
+                    });
             }
         })
         .invoke_handler(tauri::generate_handler![
+            ai_providers::ai_provider_generate,
+            ai_providers::ai_provider_cancel,
+            ai_providers::ai_provider_test,
+            credentials::ai_provider_list,
+            credentials::ai_provider_save_api_key,
+            credentials::ai_provider_remove_api_key,
             collaboration::start_collaboration_session,
             collaboration::join_collaboration_session,
             collaboration::respond_collaboration_join_request,
@@ -1359,6 +1399,21 @@ pub fn run() {
             collaboration::get_collaboration_status,
             collaboration::write_collaboration_debug_log,
             collaboration::get_collaboration_debug_log_path,
+            codex::codex_start,
+            codex::codex_status,
+            codex::codex_account_read,
+            codex::codex_login_chatgpt,
+            codex::codex_login_device_code,
+            codex::codex_login_cancel,
+            codex::codex_logout,
+            codex::codex_thread_start,
+            codex::codex_thread_resume,
+            codex::codex_turn_start,
+            codex::codex_turn_interrupt,
+            codex::codex_respond_to_server_request,
+            codex::codex_take_generated_image,
+            codex::codex_discard_generated_images,
+            codex::codex_shutdown,
             get_storage_settings,
             set_storage_root,
             reset_storage_root,

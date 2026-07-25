@@ -1,0 +1,790 @@
+.codex-panel {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  border-left: 1px solid var(--control-border);
+  background: var(--sidebar-bg);
+  color: var(--fg);
+}
+
+.codex-provider-settings {
+  position: absolute;
+  inset: 52px 0 0;
+  z-index: 4;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+  border-top: 1px solid var(--control-border);
+  background: var(--sidebar-bg);
+  padding: 12px;
+}
+
+.codex-provider-settings > header,
+.codex-provider-card > header,
+.codex-provider-card-actions,
+.codex-provider-security-note {
+  display: flex;
+  align-items: center;
+}
+
+.codex-provider-settings > header {
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.codex-provider-settings > header > div,
+.codex-provider-card > header > div {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.codex-provider-settings > header strong {
+  font-size: 13px;
+  line-height: 17px;
+}
+
+.codex-provider-settings > header span,
+.codex-provider-card > header div span {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 14px;
+}
+
+.codex-provider-settings-list {
+  display: grid;
+  gap: 8px;
+}
+
+.codex-provider-card {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--control-border);
+  border-radius: 9px;
+  background: var(--settings-row);
+  padding: 10px;
+}
+
+.codex-provider-card > header {
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.codex-provider-card > header strong {
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.codex-provider-card > header > span {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--control-bg);
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 750;
+  line-height: 16px;
+  padding: 0 6px;
+}
+
+.codex-provider-card > header > span.is-connected {
+  background: color-mix(in srgb, var(--accent) 13%, var(--control-bg));
+  color: var(--accent);
+}
+
+.codex-api-key-field {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  border: 1px solid var(--control-border);
+  border-radius: 7px;
+  background: var(--control-bg);
+  color: var(--muted);
+  padding: 0 7px;
+}
+
+.codex-api-key-field:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 72%, var(--control-border));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.codex-api-key-field input {
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--fg);
+  font: 11px/20px ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.codex-api-key-visibility {
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.codex-api-key-visibility:hover:not(:disabled) {
+  background: var(--control-hover);
+  color: var(--fg);
+}
+
+.codex-api-key-visibility:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.codex-provider-card-actions {
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.codex-provider-card-note {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 15px;
+}
+
+.codex-danger-button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: var(--danger);
+}
+
+.codex-provider-security-note {
+  align-items: flex-start;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 15px;
+  padding: 2px;
+}
+
+.codex-provider-security-note svg {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.codex-provider-success {
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--control-border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--control-bg));
+  color: var(--fg);
+  font-size: 10px;
+  line-height: 15px;
+  padding: 7px 8px;
+}
+
+.codex-panel-header {
+  display: flex;
+  min-width: 0;
+  min-height: 52px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid var(--control-border);
+  padding: 8px 10px 8px 12px;
+}
+
+.codex-panel-heading,
+.codex-panel-header-actions,
+.codex-login-actions,
+.codex-device-login > div,
+.codex-plan-card footer,
+.codex-composer-footer,
+.codex-thinking {
+  display: flex;
+  align-items: center;
+}
+
+.codex-panel-heading {
+  min-width: 0;
+  gap: 9px;
+}
+
+.codex-panel-heading > div {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.codex-panel-heading strong {
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 17px;
+}
+
+.codex-panel-heading span:not(.codex-panel-icon) {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-panel-icon,
+.codex-plan-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+}
+
+.codex-panel-header-actions {
+  gap: 3px;
+}
+
+.codex-icon-button,
+.codex-send-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.codex-icon-button:hover:not(:disabled),
+.codex-send-button:hover:not(:disabled) {
+  background: var(--control-hover);
+  color: var(--fg);
+}
+
+.codex-icon-button:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.codex-panel-state {
+  grid-row: 2 / -1;
+  display: grid;
+  min-width: 0;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  color: var(--muted);
+  padding: 24px;
+  text-align: center;
+}
+
+.codex-panel-state strong {
+  color: var(--fg);
+  font-size: 14px;
+}
+
+.codex-panel-state > span {
+  max-width: 300px;
+  font-size: 12px;
+  line-height: 17px;
+}
+
+.codex-login-actions {
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 7px;
+}
+
+.codex-primary-button,
+.codex-secondary-button {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border-radius: 7px;
+  padding: 0 11px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.codex-primary-button {
+  background: var(--accent);
+  color: #ffffff;
+}
+
+.app-shell[data-theme="dark"] .codex-primary-button {
+  color: #17211f;
+}
+
+.codex-primary-button:hover:not(:disabled) {
+  filter: brightness(1.04);
+}
+
+.codex-secondary-button {
+  border: 1px solid var(--control-border);
+  background: var(--control-bg);
+  color: var(--fg);
+}
+
+.codex-secondary-button:hover:not(:disabled) {
+  background: var(--control-hover);
+}
+
+.codex-primary-button:disabled,
+.codex-secondary-button:disabled,
+.codex-send-button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.codex-device-login {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--control-border);
+  border-radius: 8px;
+  background: var(--settings-row);
+  padding: 10px;
+}
+
+.codex-device-login code {
+  border-radius: 6px;
+  background: var(--settings-code-bg);
+  color: var(--fg);
+  font: 700 15px/24px ui-monospace, SFMono-Regular, Consolas, monospace;
+  letter-spacing: 0.08em;
+  padding: 5px 10px;
+}
+
+.codex-device-login > div {
+  justify-content: center;
+  gap: 6px;
+}
+
+.codex-scope-switch {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  border-bottom: 1px solid var(--control-border);
+  padding: 7px 8px;
+}
+
+.codex-scope-switch button {
+  min-width: 0;
+  min-height: 29px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.codex-scope-switch button:hover:not(:disabled),
+.codex-scope-switch button.is-active {
+  background: var(--control-bg);
+  color: var(--fg);
+}
+
+.codex-scope-switch button:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.codex-messages {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+  padding: 12px;
+}
+
+.codex-message {
+  display: grid;
+  max-width: 94%;
+  gap: 3px;
+}
+
+.codex-message > span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+  line-height: 13px;
+}
+
+.codex-message p {
+  margin: 0;
+  border: 1px solid var(--control-border);
+  border-radius: 9px;
+  background: var(--control-bg);
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 18px;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+}
+
+.codex-message-user {
+  align-self: flex-end;
+}
+
+.codex-message-user > span {
+  text-align: right;
+}
+
+.codex-message-user p {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--control-border));
+  background: color-mix(in srgb, var(--accent) 11%, var(--control-bg));
+}
+
+.codex-thinking {
+  gap: 7px;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 4px 2px;
+}
+
+.is-spinning {
+  animation: codex-spin 900ms linear infinite;
+}
+
+@keyframes codex-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.codex-error {
+  border: 1px solid color-mix(in srgb, var(--danger) 38%, var(--control-border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--danger) 9%, var(--control-bg));
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 16px;
+  padding: 8px 9px;
+}
+
+.codex-undo-button {
+  display: inline-flex;
+  align-self: flex-start;
+  min-height: 31px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--control-border);
+  border-radius: 7px;
+  background: var(--control-bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 0 9px;
+  cursor: pointer;
+}
+
+.codex-undo-button:hover {
+  background: var(--control-hover);
+}
+
+.codex-plan-card {
+  display: grid;
+  gap: 9px;
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--control-border));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--accent) 7%, var(--settings-row));
+  padding: 10px;
+}
+
+.codex-plan-card header {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.codex-plan-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+}
+
+.codex-plan-card header > div {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.codex-plan-card strong {
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.codex-plan-card header span:not(.codex-plan-icon) {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-plan-card p {
+  margin: 0;
+  color: var(--fg);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.codex-plan-card footer {
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.codex-composer {
+  display: grid;
+  gap: 6px;
+  border-top: 1px solid var(--control-border);
+  padding: 9px;
+}
+
+.codex-composer textarea {
+  width: 100%;
+  min-height: 68px;
+  max-height: 160px;
+  resize: vertical;
+  border: 1px solid var(--control-border);
+  border-radius: 8px;
+  outline: 0;
+  background: var(--control-bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  line-height: 18px;
+  padding: 8px 9px;
+}
+
+.codex-composer textarea:focus {
+  border-color: color-mix(in srgb, var(--accent) 72%, var(--control-border));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent);
+}
+
+.codex-composer textarea:disabled {
+  opacity: 0.55;
+}
+
+.codex-composer-options {
+  display: grid;
+  grid-template-columns: minmax(76px, 0.8fr) minmax(104px, 1.2fr) minmax(72px, 0.8fr);
+  gap: 5px;
+}
+
+.codex-composer-options label {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.codex-composer-options label > span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-composer-options select {
+  width: 100%;
+  min-width: 0;
+  height: 29px;
+  overflow: hidden;
+  border: 1px solid var(--control-border);
+  border-radius: 6px;
+  outline: 0;
+  background: var(--control-bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 10px;
+  line-height: 27px;
+  padding: 0 5px;
+  text-overflow: ellipsis;
+}
+
+.codex-composer-options select:focus {
+  border-color: color-mix(in srgb, var(--accent) 72%, var(--control-border));
+}
+
+.codex-composer-options select:disabled {
+  opacity: 0.55;
+}
+
+.codex-provider-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 14px;
+}
+
+.codex-provider-hint svg {
+  flex: 0 0 auto;
+  color: var(--muted);
+  margin-top: 1px;
+}
+
+.codex-composer-footer {
+  min-width: 0;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.codex-composer-footer > span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-send-button {
+  background: var(--accent);
+  color: #ffffff;
+}
+
+.app-shell[data-theme="dark"] .codex-send-button {
+  color: #17211f;
+}
+
+.codex-send-button:hover:not(:disabled) {
+  background: var(--accent);
+  color: #ffffff;
+  filter: brightness(1.04);
+}
+
+@media (max-width: 1080px) {
+  .workspace.codex-open {
+    grid-template-columns: minmax(0, 1fr) minmax(300px, 340px);
+  }
+}
+
+@media (max-width: 980px) {
+  .workspace.codex-open {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .workspace.codex-open > .codex-panel {
+    position: absolute;
+    top: 57px;
+    right: 0;
+    bottom: 0;
+    grid-column: 1;
+    grid-row: 2;
+    z-index: 30;
+    width: min(360px, 100%);
+    border-left: 1px solid var(--control-border);
+    box-shadow: -12px 0 30px rgba(0, 0, 0, 0.18);
+  }
+}
+
+@media (max-width: 340px) {
+  .codex-composer-options {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .codex-composer-options .codex-model-select {
+    grid-column: 1 / -1;
+    grid-row: 1;
+  }
+}
+
+.codex-preview-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 18;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.codex-preview-element {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: grid;
+  min-width: 14px;
+  min-height: 14px;
+  place-items: center;
+  transform-origin: center;
+  border: 2px dashed var(--codex-preview-stroke, var(--accent));
+  border-radius: 5px;
+  background: color-mix(
+    in srgb,
+    var(--codex-preview-fill, var(--accent)) 14%,
+    transparent
+  );
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.codex-preview-element > span {
+  position: relative;
+  z-index: 1;
+  max-width: 100%;
+  overflow: hidden;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: 750;
+  line-height: 14px;
+  padding: 2px 5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-preview-element > img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 3px;
+  object-fit: contain;
+  opacity: 0.9;
+}
+
+.app-shell[data-theme="dark"] .codex-preview-element > span {
+  color: #17211f;
+}
+
+.codex-preview-created {
+  border-style: solid;
+}
+
+.codex-preview-deleted {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.codex-preview-deleted > span {
+  background: var(--danger);
+  color: #ffffff;
+  text-decoration: line-through;
+}

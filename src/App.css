@@ -430,13 +430,21 @@ button {
 }
 
 .workspace {
+  position: relative;
   display: grid;
   min-width: 0;
   min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: 57px minmax(0, 1fr);
 }
 
+.workspace.codex-open {
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 380px);
+}
+
 .topbar {
+  grid-column: 1 / -1;
+  grid-row: 1;
   display: grid;
   grid-template-columns: minmax(180px, 1fr) auto;
   align-items: center;
@@ -603,6 +611,17 @@ button {
   color: var(--accent);
 }
 
+.topbar-actions .codex-trigger {
+  width: 36px;
+  padding: 0;
+}
+
+.topbar-actions .codex-trigger.is-active,
+.topbar-actions .codex-trigger.is-active:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent);
+}
+
 .export-menu {
   position: relative;
   display: flex;
@@ -694,10 +713,17 @@ button {
 
 .canvas-host {
   position: relative;
+  grid-column: 1;
+  grid-row: 2;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   background: var(--canvas-bg);
+}
+
+.workspace > .codex-panel {
+  grid-column: 2;
+  grid-row: 2;
 }
 
 .canvas-host .excalidraw {

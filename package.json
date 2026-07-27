@@ -1,7 +1,7 @@
 {
   "name": "excalibur",
   "private": true,
-  "version": "0.4.9",
+  "version": "0.4.10",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "relay:signal": "node scripts/signal-relay.mjs",
     "postinstall": "node scripts/patch-excalidraw.mjs",
+    "test:selection": "node scripts/excalidraw-selection-smoke.mjs",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"

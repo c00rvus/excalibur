@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const packageRoot = join(
@@ -685,6 +685,182 @@ var createExcaliburPartialTextStrokeResult = (elements, appState, value, app) =>
 
 const richTextStrokeProd = String.raw`;var EXCALIBUR_RICH_TEXT_SELECTION_MAX_AGE=15e3,excaliburGetRichTextSelectionTarget=()=>typeof window!="undefined"?window:globalThis,excaliburGetRichTextSelectionState=()=>excaliburGetRichTextSelectionTarget().__excaliburRichTextSelection??null,excaliburSetRichTextSelectionState=e=>{excaliburGetRichTextSelectionTarget().__excaliburRichTextSelection=e},excaliburClearRichTextSelectionState=()=>{delete excaliburGetRichTextSelectionTarget().__excaliburRichTextSelection},excaliburGetWysiwygSelection=e=>{let o=Number(e.dataset.excaliburSelectionStart),t=Number(e.dataset.excaliburSelectionEnd),r=e.selectionStart,n=e.selectionEnd,i=Number.isFinite(r)&&r!==n?r:o,a=Number.isFinite(n)&&r!==n?n:t;return Number.isFinite(i)&&Number.isFinite(a)?{start:Math.max(0,Math.min(i,a)),end:Math.max(0,Math.max(i,a))}:null},excaliburRememberWysiwygSelection=(e,o)=>{let t=o.selectionStart,r=o.selectionEnd;Number.isFinite(t)&&Number.isFinite(r)&&t!==r&&(o.dataset.excaliburSelectionStart=String(Math.min(t,r)),o.dataset.excaliburSelectionEnd=String(Math.max(t,r)));let n=excaliburGetWysiwygSelection(o);return n&&n.start!==n.end&&excaliburSetRichTextSelectionState({elementId:e,start:n.start,end:n.end,text:tn(o.value),updatedAt:Date.now()}),n},excaliburGetStoredWysiwygSelection=e=>{let o=excaliburGetRichTextSelectionState();if(!o||Date.now()-o.updatedAt>EXCALIBUR_RICH_TEXT_SELECTION_MAX_AGE)return null;let t=e.editingTextElement?.id,r=e.selectedElementIds||{};return t&&t!==o.elementId?null:!t&&Object.keys(r).length>0&&!r[o.elementId]?null:o},excaliburNormalizeTextColorRanges=(e,o)=>Array.isArray(e)?e.map(t=>({start:Math.max(0,Math.min(o,Number(t.start))),end:Math.max(0,Math.min(o,Number(t.end))),color:typeof t.color=="string"?t.color:""})).filter(t=>t.color&&Number.isFinite(t.start)&&Number.isFinite(t.end)&&t.start<t.end).sort((t,r)=>t.start-r.start||t.end-r.end):[],excaliburMergeTextColorRanges=e=>{let o=[];for(let t of e){let r=o[o.length-1];r&&r.end===t.start&&r.color===t.color?r.end=t.end:o.push({...t})}return o},excaliburApplyTextColorRange=(e,o,t,r,n)=>{let i=excaliburNormalizeTextColorRanges(e.customData?.excaliburTextColorRanges,n),a=[];for(let l of i)l.end<=o||l.start>=t?a.push(l):(l.start<o&&a.push({start:l.start,end:o,color:l.color}),l.end>t&&a.push({start:t,end:l.end,color:l.color}));return r!==e.strokeColor&&a.push({start:o,end:t,color:r}),excaliburMergeTextColorRanges(a.filter(l=>l.start<l.end).sort((l,s)=>l.start-s.start||l.end-s.end))},excaliburGetWysiwygTextColorRanges=(e,o)=>excaliburNormalizeTextColorRanges(e.customData?.excaliburTextColorRanges,tn(String(o??e.originalText??e.text??"")).length),excaliburGetWysiwygColorAtOffset=(e,o,t)=>{for(let r=e.length-1;r>=0;r--){let n=e[r];if(o>=n.start&&o<n.end)return n.color}return t},excaliburAppendWysiwygMirrorSegment=(e,o,t)=>{let r=e.ownerDocument.createElement("span");r.textContent=o,r.style.color=t,e.appendChild(r)},excaliburRenderWysiwygMirrorText=(e,o,t,r)=>{e.replaceChildren();let n=tn(String(o??""));if(!n){excaliburAppendWysiwygMirrorSegment(e,"\u200b",r);return}let i="",a=null,l=()=>{i&&(excaliburAppendWysiwygMirrorSegment(e,i,a||r),i="")};for(let s=0;s<n.length;s++){let c=n[s];if(c==="\n"){l(),e.appendChild(e.ownerDocument.createElement("br")),s===n.length-1&&excaliburAppendWysiwygMirrorSegment(e,"\u200b",r);continue}let m=excaliburGetWysiwygColorAtOffset(t,s,r);a!==m&&(l(),a=m),i+=c}l()},excaliburCreateWysiwygMirror=()=>{let e=document.createElement("div");return e.className="excalibur-rich-text-wysiwyg-mirror",Object.assign(e.style,{position:"absolute",display:"none",minHeight:"1em",backfaceVisibility:"hidden",margin:0,padding:0,border:0,outline:0,resize:"none",background:"transparent",overflow:"hidden",pointerEvents:"none",userSelect:"none",zIndex:"var(--zIndex-wysiwyg)",boxSizing:"content-box"}),e},excaliburSyncWysiwygMirror=(e,o,t,r=t)=>{let n=r||t,i=excaliburGetWysiwygTextColorRanges(n,o.value);if(o.style.caretColor=n.strokeColor,!i.length){e.style.display="none",o.style.color=n.strokeColor,o.style.webkitTextFillColor="";return}for(let a of["font","fontFamily","fontSize","fontWeight","fontStyle","lineHeight","width","height","left","top","transform","textAlign","verticalAlign","opacity","filter","maxHeight","wordBreak","whiteSpace","overflowWrap"])e.style[a]=o.style[a];e.dir=o.dir,e.style.display=o.style.display||"inline-block",e.style.color=n.strokeColor,excaliburRenderWysiwygMirrorText(e,o.value,i,n.strokeColor),o.style.color="transparent",o.style.webkitTextFillColor="transparent"},excaliburPartialTextStroke=(e,o,t,r)=>{let n=t?.currentItemStrokeColor;if(!n)return null;let i=o.editingTextElement,a=i&&Y(i)?i.id:null,l=null,s=null,c=r?.excalidrawContainerRef?.current?.querySelector("textarea.excalidraw-wysiwyg"),m=c instanceof HTMLTextAreaElement?c.dataset.excaliburElementId:null;c instanceof HTMLTextAreaElement&&(a||m)&&(a=a||m,l=excaliburRememberWysiwygSelection(a,c),s=tn(c.value));let d=excaliburGetStoredWysiwygSelection(o);if((!l||l.start===l.end||!a)&&d&&(a=d.elementId,l={start:d.start,end:d.end},s=tn(d.text??"")),!l||l.start===l.end||!a)return null;let p=e.find(u=>u.id===a);if(!p||!Y(p))return null;s=s||tn(p.originalText??p.text??"");let u=s.length,h=Math.min(l.start,u),f=Math.min(l.end,u);if(h===f)return null;let b=h===0&&f===u,x=b?[]:excaliburApplyTextColorRange(p,h,f,n,u),T={...(p.customData||{})};x.length?T.excaliburTextColorRanges=x:delete T.excaliburTextColorRanges;let w=q(p,{strokeColor:b?n:p.strokeColor,customData:T},!0);return excaliburClearRichTextSelectionState(),c instanceof HTMLTextAreaElement&&setTimeout(()=>{c.dispatchEvent(new Event("excalibur-rich-text-format-applied"))}),{elements:e.map(C=>C.id===p.id?w:C),appState:{...o,...t},captureUpdate:L.IMMEDIATELY}};`;
 
+const createMarqueeSelectionGeometry = (shapeResolver) => String.raw`
+var excaliburMarqueePointInBounds = (point, bounds) => {
+  return point[0] >= bounds[0] && point[0] <= bounds[2] &&
+    point[1] >= bounds[1] && point[1] <= bounds[3];
+};
+var excaliburMarqueePointOnSegment = (point, start, end) => {
+  const epsilon = 1e-6;
+  const cross = (end[0] - start[0]) * (point[1] - start[1]) -
+    (end[1] - start[1]) * (point[0] - start[0]);
+  return Math.abs(cross) <= epsilon &&
+    point[0] >= Math.min(start[0], end[0]) - epsilon &&
+    point[0] <= Math.max(start[0], end[0]) + epsilon &&
+    point[1] >= Math.min(start[1], end[1]) - epsilon &&
+    point[1] <= Math.max(start[1], end[1]) + epsilon;
+};
+var excaliburMarqueeSegmentsIntersect = (a, b, c, d) => {
+  const epsilon = 1e-6;
+  const direction = (p, q, r) =>
+    (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+  const d1 = direction(a, b, c);
+  const d2 = direction(a, b, d);
+  const d3 = direction(c, d, a);
+  const d4 = direction(c, d, b);
+  if (
+    ((d1 > epsilon && d2 < -epsilon) || (d1 < -epsilon && d2 > epsilon)) &&
+    ((d3 > epsilon && d4 < -epsilon) || (d3 < -epsilon && d4 > epsilon))
+  ) {
+    return true;
+  }
+  return Math.abs(d1) <= epsilon && excaliburMarqueePointOnSegment(c, a, b) ||
+    Math.abs(d2) <= epsilon && excaliburMarqueePointOnSegment(d, a, b) ||
+    Math.abs(d3) <= epsilon && excaliburMarqueePointOnSegment(a, c, d) ||
+    Math.abs(d4) <= epsilon && excaliburMarqueePointOnSegment(b, c, d);
+};
+var excaliburMarqueePointInPolygon = (point, polygon) => {
+  let inside = false;
+  for (let current = 0, previous = polygon.length - 1; current < polygon.length; previous = current++) {
+    const start = polygon[previous];
+    const end = polygon[current];
+    if (excaliburMarqueePointOnSegment(point, start, end)) {
+      return true;
+    }
+    if (
+      (end[1] > point[1]) !== (start[1] > point[1]) &&
+      point[0] <
+        (start[0] - end[0]) * (point[1] - end[1]) /
+          (start[1] - end[1]) +
+        end[0]
+    ) {
+      inside = !inside;
+    }
+  }
+  return inside;
+};
+var excaliburMarqueePointInEllipse = (point, ellipse) => {
+  const cos = Math.cos(-ellipse.angle);
+  const sin = Math.sin(-ellipse.angle);
+  const translatedX = point[0] - ellipse.center[0];
+  const translatedY = point[1] - ellipse.center[1];
+  const x = translatedX * cos - translatedY * sin;
+  const y = translatedX * sin + translatedY * cos;
+  const halfWidth = Math.abs(ellipse.halfWidth) || 1e-6;
+  const halfHeight = Math.abs(ellipse.halfHeight) || 1e-6;
+  return x * x / (halfWidth * halfWidth) +
+    y * y / (halfHeight * halfHeight) <= 1;
+};
+var excaliburMarqueeSampleCurve = (curve) => {
+  const points = [];
+  for (let step = 0; step <= 20; step++) {
+    const t = step / 20;
+    const inverse = 1 - t;
+    points.push([
+      inverse ** 3 * curve[0][0] +
+        3 * inverse ** 2 * t * curve[1][0] +
+        3 * inverse * t ** 2 * curve[2][0] +
+        t ** 3 * curve[3][0],
+      inverse ** 3 * curve[0][1] +
+        3 * inverse ** 2 * t * curve[1][1] +
+        3 * inverse * t ** 2 * curve[2][1] +
+        t ** 3 * curve[3][1],
+    ]);
+  }
+  return points;
+};
+var excaliburMarqueeShapePaths = (shape) => {
+  switch (shape.type) {
+    case "polygon":
+      return [{ points: Array.from(shape.data), closed: true }];
+    case "ellipse": {
+      const points = [];
+      const cos = Math.cos(shape.data.angle);
+      const sin = Math.sin(shape.data.angle);
+      for (let step = 0; step < 64; step++) {
+        const angle = step / 64 * Math.PI * 2;
+        const x = Math.cos(angle) * shape.data.halfWidth;
+        const y = Math.sin(angle) * shape.data.halfHeight;
+        points.push([
+          shape.data.center[0] + x * cos - y * sin,
+          shape.data.center[1] + x * sin + y * cos,
+        ]);
+      }
+      return [{ points, closed: true }];
+    }
+    case "line":
+      return [{ points: Array.from(shape.data), closed: false }];
+    case "polyline":
+      return [{
+        points: shape.data.length
+          ? [shape.data[0][0], ...shape.data.map((segment) => segment[1])]
+          : [],
+        closed: false,
+      }];
+    case "curve":
+      return [{ points: excaliburMarqueeSampleCurve(shape.data), closed: false }];
+    case "polycurve":
+      return shape.data.map((curve) => ({
+        points: excaliburMarqueeSampleCurve(curve),
+        closed: false,
+      }));
+    default:
+      return [];
+  }
+};
+var excaliburElementIntersectsMarquee = (element, bounds, elementsMap) => {
+  const shape = ${shapeResolver}(element, elementsMap);
+  if (!shape) {
+    return true;
+  }
+  const corners = [
+    [bounds[0], bounds[1]],
+    [bounds[2], bounds[1]],
+    [bounds[2], bounds[3]],
+    [bounds[0], bounds[3]],
+  ];
+  const marqueeEdges = corners.map((corner, index) => [
+    corner,
+    corners[(index + 1) % corners.length],
+  ]);
+  const paths = excaliburMarqueeShapePaths(shape);
+  for (const path of paths) {
+    if (path.points.some((point) => excaliburMarqueePointInBounds(point, bounds))) {
+      return true;
+    }
+    const segmentCount = path.closed ? path.points.length : path.points.length - 1;
+    for (let index = 0; index < segmentCount; index++) {
+      const start = path.points[index];
+      const end = path.points[(index + 1) % path.points.length];
+      if (
+        marqueeEdges.some((edge) =>
+          excaliburMarqueeSegmentsIntersect(start, end, edge[0], edge[1])
+        )
+      ) {
+        return true;
+      }
+    }
+  }
+  if (
+    shape.type === "polygon" &&
+    corners.some((corner) => excaliburMarqueePointInPolygon(corner, shape.data))
+  ) {
+    return true;
+  }
+  if (
+    shape.type === "ellipse" &&
+    corners.some((corner) => excaliburMarqueePointInEllipse(corner, shape.data))
+  ) {
+    return true;
+  }
+  return false;
+};
+`;
+
+const marqueeSelectionGeometryDev =
+  createMarqueeSelectionGeometry("getElementShape");
+const marqueeSelectionGeometryProd = createMarqueeSelectionGeometry("ti");
+
 function replaceOnce(content, search, replacement, file, label) {
   if (content.includes(replacement)) {
     return content;
@@ -739,6 +915,8 @@ const repAll = (search, replacement, label) => (content, file) =>
   replaceAll(content, search, replacement, file, label);
 const repOptional = (search, replacement) => (content) =>
   replaceOptional(content, search, replacement);
+const appendOptional = (addition) => (content) =>
+  content.includes(addition.trim()) ? content : `${content}\n${addition}`;
 
 function patchDevAudioDrawer(content, file) {
   const startMarker = "\nvar formatExcaliburAudioDuration = (durationMs) => {";
@@ -951,6 +1129,16 @@ const prodAudioShapeAfterEraser =
   '{icon:Kd,value:"image",key:null,numericKey:Q[9],fillable:!1},{icon:Hd,value:"eraser",key:Q.E,numericKey:Q[0],fillable:!1},{icon:H4,value:"audio",key:null,numericKey:null,fillable:!1}]';
 
 patchFile(files.devCore, [
+  appendOptional(marqueeSelectionGeometryDev),
+  repOptional(
+    'selectionX1 <= elementX2 && selectionY1 <= elementY2 && selectionX2 >= elementX1 && selectionY2 >= elementY1',
+    'selectionX1 <= elementX2 && selectionY1 <= elementY2 && selectionX2 >= elementX1 && selectionY2 >= elementY1 && excaliburElementIntersectsMarquee(element, [selectionX1, selectionY1, selectionX2, selectionY2], elementsMap)',
+  ),
+  rep(
+    'selectionX1 <= elementX1 && selectionY1 <= elementY1 && selectionX2 >= elementX2 && selectionY2 >= elementY2',
+    'selectionX1 <= elementX2 && selectionY1 <= elementY2 && selectionX2 >= elementX1 && selectionY2 >= elementY1 && excaliburElementIntersectsMarquee(element, [selectionX1, selectionY1, selectionX2, selectionY2], elementsMap)',
+    "geometry-aware marquee overlap selection",
+  ),
   rep(
     '"image"\n]);',
     '"image",\n  "audio"\n]);',
@@ -1040,6 +1228,16 @@ patchFile(files.devCore, [
 ]);
 
 patchFile(files.prodCore, [
+  appendOptional(marqueeSelectionGeometryProd),
+  repOptional(
+    'o<=p&&i<=m&&a>=l&&s>=U',
+    'o<=p&&i<=m&&a>=l&&s>=U&&excaliburElementIntersectsMarquee(c,[o,i,a,s],n)',
+  ),
+  rep(
+    'o<=l&&i<=U&&a>=p&&s>=m',
+    'o<=p&&i<=m&&a>=l&&s>=U&&excaliburElementIntersectsMarquee(c,[o,i,a,s],n)',
+    "prod geometry-aware marquee overlap selection",
+  ),
   rep('JE=new Set(["iframe","embeddable","image"])', 'JE=new Set(["iframe","embeddable","image","audio"])', "prod library disabled audio type"),
   rep('image:"image",eraser:"eraser"', 'image:"image",audio:"audio",eraser:"eraser"', "prod TOOL_TYPE audio"),
   rep(
@@ -1253,3 +1451,8 @@ patchFile(files.elementTypes, [
     "audio bindable union",
   ),
 ]);
+
+rmSync(join(process.cwd(), "node_modules", ".vite"), {
+  force: true,
+  recursive: true,
+});

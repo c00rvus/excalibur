@@ -9,14 +9,14 @@ peer-to-peer collaboration.
 
 Get the latest release from GitHub:
 
-[Download Excalibur v0.4.9](https://github.com/c00rvus/excalibur/releases/tag/v0.4.9)
+[Download Excalibur v0.4.10](https://github.com/c00rvus/excalibur/releases/tag/v0.4.10)
 
 Common installers:
 
-- [Windows setup `.exe`](https://github.com/c00rvus/excalibur/releases/download/v0.4.9/Excalibur_0.4.9_x64-setup.exe)
-- [Windows `.msi`](https://github.com/c00rvus/excalibur/releases/download/v0.4.9/Excalibur_0.4.9_x64_en-US.msi)
-- [macOS universal `.dmg`](https://github.com/c00rvus/excalibur/releases/download/v0.4.9/Excalibur_0.4.9_universal.dmg)
-- [Linux AppImage](https://github.com/c00rvus/excalibur/releases/download/v0.4.9/Excalibur_0.4.9_amd64.AppImage)
+- [Windows setup `.exe`](https://github.com/c00rvus/excalibur/releases/download/v0.4.10/Excalibur_0.4.10_x64-setup.exe)
+- [Windows `.msi`](https://github.com/c00rvus/excalibur/releases/download/v0.4.10/Excalibur_0.4.10_x64_en-US.msi)
+- [macOS universal `.dmg`](https://github.com/c00rvus/excalibur/releases/download/v0.4.10/Excalibur_0.4.10_universal.dmg)
+- [Linux AppImage](https://github.com/c00rvus/excalibur/releases/download/v0.4.10/Excalibur_0.4.10_amd64.AppImage)
 
 ## Highlights
 

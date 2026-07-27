@@ -87,6 +87,8 @@ import {
   createInternalPasteEvent,
   embedInternalClipboardMarker,
   getClipboardContentSignature,
+  getExternalClipboardHtml,
+  getExternalClipboardSelectionMode,
   extractInternalClipboardCopyId,
   INTERNAL_CLIPBOARD_TTL_MS,
   isInternalClipboardSnapshotFresh,
@@ -738,38 +740,12 @@ function getOrderedClipboardParts(
     });
 }
 
-function escapeHtml(value: string) {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
 function getClipboardPlainText(parts: readonly ClipboardRichPart[]) {
   return parts
     .filter((part) => part.kind === "text")
     .map((part) => part.text)
     .filter(Boolean)
     .join("\n\n");
-}
-
-function getClipboardHtml(parts: readonly ClipboardRichPart[]) {
-  if (!parts.length) {
-    return "";
-  }
-
-  const blocks = parts
-    .map((part) => {
-      if (part.kind === "text") {
-        return `<div style="white-space:pre-wrap;margin:0 0 12px 0;">${escapeHtml(part.text)}</div>`;
-      }
-
-      return `<img src="${escapeHtml(part.dataURL)}" width="${part.width}" height="${part.height}" style="display:block;max-width:100%;height:auto;margin:0 0 12px 0;" />`;
-    })
-    .join("");
-
-  return `<!doctype html><html><body><div>${blocks}</div></body></html>`;
 }
 
 function formatRelativeTime(value: number) {
@@ -5701,12 +5677,18 @@ function App() {
         copyableSelectedElements,
         filesRef.current,
       );
-      const plainText = getClipboardPlainText(orderedClipboardParts);
       const hasText = orderedClipboardParts.some((part) => part.kind === "text");
       const hasImage = orderedClipboardParts.some((part) => part.kind === "image");
-      const shouldCopyRichContent = hasText && hasImage;
-      const shouldCopyImageBlob =
-        copyableSelectedElements.length > 0 && !shouldCopyRichContent && !hasText;
+      const externalClipboardMode = getExternalClipboardSelectionMode(
+        copyableSelectedElements,
+        { hasImage, hasText },
+      );
+      const shouldCopyRichContent = externalClipboardMode === "rich";
+      const shouldCopyImageBlob = externalClipboardMode === "raster";
+      const plainText =
+        externalClipboardMode === "raster"
+          ? ""
+          : getClipboardPlainText(orderedClipboardParts);
       const backgroundColor =
         appState.viewBackgroundColor || getCanvasBackground(appTheme);
       const imageBlob = shouldCopyImageBlob
@@ -5724,8 +5706,8 @@ function App() {
           })
         : null;
       const clipboardHtml = embedInternalClipboardMarker(
-        orderedClipboardParts.length
-          ? getClipboardHtml(orderedClipboardParts)
+        externalClipboardMode !== "raster" && orderedClipboardParts.length
+          ? getExternalClipboardHtml(orderedClipboardParts)
           : "",
         copyId,
       );
@@ -5836,7 +5818,9 @@ function App() {
       }, 1300);
       setStatus(
         shouldCopyRichContent
-          ? "Texto e imagens copiados"
+          ? hasText
+            ? "Texto e imagens copiados"
+            : "Imagens copiadas separadamente"
           : shouldCopyImageBlob
             ? "Selecao copiada como imagem"
             : plainText
@@ -5954,11 +5938,18 @@ function App() {
         copyableSelectedElements,
         filesRef.current,
       );
-      const plainText = getClipboardPlainText(orderedClipboardParts);
       const hasText = orderedClipboardParts.some((part) => part.kind === "text");
       const hasImage = orderedClipboardParts.some((part) => part.kind === "image");
-      const shouldCopyRichContent = hasText && hasImage;
-      const shouldCopyImageBlob = !shouldCopyRichContent && !hasText;
+      const externalClipboardMode = getExternalClipboardSelectionMode(
+        copyableSelectedElements,
+        { hasImage, hasText },
+      );
+      const shouldCopyRichContent = externalClipboardMode === "rich";
+      const shouldCopyImageBlob = externalClipboardMode === "raster";
+      const plainText =
+        externalClipboardMode === "raster"
+          ? ""
+          : getClipboardPlainText(orderedClipboardParts);
       const backgroundColor =
         appState.viewBackgroundColor || getCanvasBackground(appTheme);
       const imageBlob = shouldCopyImageBlob
@@ -5976,7 +5967,7 @@ function App() {
         : null;
       const result = await writeSelectionToClipboard({
         html: shouldCopyRichContent
-          ? getClipboardHtml(orderedClipboardParts)
+          ? getExternalClipboardHtml(orderedClipboardParts)
           : undefined,
         imageBlob,
         plainText,
@@ -5989,7 +5980,9 @@ function App() {
       }, 1300);
       setStatus(
         result === "rich"
-          ? "Selecao copiada com texto e imagens"
+          ? hasText
+            ? "Selecao copiada com texto e imagens"
+            : "Imagens copiadas separadamente"
           : result === "image"
             ? "Selecao copiada como imagem"
             : "Texto copiado",

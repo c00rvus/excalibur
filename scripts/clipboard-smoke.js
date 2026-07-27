@@ -11,6 +11,8 @@ async (page) => {
       embedInternalClipboardMarker,
       extractInternalClipboardCopyId,
       getClipboardContentSignature,
+      getExternalClipboardHtml,
+      getExternalClipboardSelectionMode,
       isInternalClipboardSnapshotFresh,
       isWritableClipboardTarget,
       serializeInternalClipboard,
@@ -112,6 +114,70 @@ async (page) => {
       connectedArrow,
       deletedChild,
     ];
+    const standaloneText = element({
+      id: "standalone-text",
+      type: "text",
+      text: "Texto",
+      rawText: "Texto",
+    });
+    const standaloneImage = element({
+      id: "standalone-image",
+      type: "image",
+      fileId: "file-used",
+    });
+    const secondStandaloneImage = element({
+      id: "standalone-image-2",
+      type: "image",
+      fileId: "file-used",
+    });
+    const nativeRectangle = element({
+      id: "native-rectangle",
+      type: "rectangle",
+    });
+    const nativeDraw = element({
+      id: "native-draw",
+      type: "freedraw",
+    });
+    const imageOnlyClipboardMode = getExternalClipboardSelectionMode(
+      [standaloneImage, secondStandaloneImage],
+      { hasImage: true, hasText: false },
+    );
+    const textAndImageClipboardMode = getExternalClipboardSelectionMode(
+      [standaloneText, standaloneImage],
+      { hasImage: true, hasText: true },
+    );
+    const textOnlyClipboardMode = getExternalClipboardSelectionMode(
+      [standaloneText],
+      { hasImage: false, hasText: true },
+    );
+    const shapeAndContentClipboardMode = getExternalClipboardSelectionMode(
+      [standaloneText, standaloneImage, nativeRectangle],
+      { hasImage: true, hasText: true },
+    );
+    const drawAndImageClipboardMode = getExternalClipboardSelectionMode(
+      [standaloneImage, nativeDraw],
+      { hasImage: true, hasText: false },
+    );
+    const separateImagesHtml = getExternalClipboardHtml([
+      {
+        kind: "image",
+        dataURL: "data:image/png;base64,AAAA",
+        width: 120,
+        height: 80,
+      },
+      {
+        kind: "image",
+        dataURL: "data:image/png;base64,BBBB",
+        width: 90,
+        height: 60,
+      },
+    ]);
+    const firstImagePosition = separateImagesHtml.indexOf(
+      "data:image/png;base64,AAAA",
+    );
+    const secondImagePosition = separateImagesHtml.indexOf(
+      "data:image/png;base64,BBBB",
+    );
 
     const collected = collectInternalClipboardElements(scene, {
       "child-image": true,
@@ -485,6 +551,19 @@ async (page) => {
     }
 
     return {
+      imageOnlySelectionKeepsImagesSeparate:
+        imageOnlyClipboardMode === "rich" &&
+        (separateImagesHtml.match(/<img /g) ?? []).length === 2 &&
+        firstImagePosition >= 0 &&
+        secondImagePosition > firstImagePosition,
+      textAndImageSelectionKeepsRichOrdering:
+        textAndImageClipboardMode === "rich",
+      textOnlySelectionUsesPlainText:
+        textOnlyClipboardMode === "text",
+      nativeShapeForcesWholeSelectionRasterization:
+        shapeAndContentClipboardMode === "raster",
+      nativeDrawForcesWholeSelectionRasterization:
+        drawAndImageClipboardMode === "raster",
       copyIdsAreUniqueAndPortable:
         copyIdA !== copyIdB &&
         /^[A-Za-z0-9_-]{8,128}$/.test(copyIdA) &&

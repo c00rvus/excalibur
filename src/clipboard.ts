@@ -37,8 +37,34 @@ export type ClipboardRepresentationPayload = {
   renderImageBlobInHtml?: boolean;
 };
 
+export type ExternalClipboardSelectionMode =
+  | "empty"
+  | "raster"
+  | "rich"
+  | "text";
+
+type ExternalClipboardHtmlPart =
+  | {
+      kind: "text";
+      text: string;
+    }
+  | {
+      dataURL: string;
+      height: number;
+      kind: "image";
+      width: number;
+    };
+
 function isFrameLikeElement(element: ExcalidrawElement) {
   return element.type === "frame" || element.type === "magicframe";
+}
+
+function escapeClipboardHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 function normalizeCopyId(value: string | null | undefined) {
@@ -125,6 +151,59 @@ export function createClipboardCopyId() {
   }
 
   return `copy_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`;
+}
+
+export function getExternalClipboardSelectionMode(
+  elements: readonly ExcalidrawElement[],
+  content: {
+    hasImage: boolean;
+    hasText: boolean;
+  },
+): ExternalClipboardSelectionMode {
+  const copyableElements = elements.filter((element) => !element.isDeleted);
+
+  if (!copyableElements.length) {
+    return "empty";
+  }
+
+  if (
+    copyableElements.some(
+      (element) => element.type !== "image" && element.type !== "text",
+    )
+  ) {
+    return "raster";
+  }
+
+  if (content.hasImage) {
+    return "rich";
+  }
+
+  if (content.hasText) {
+    return "text";
+  }
+
+  // Preserve otherwise unreadable image/text elements through a visual fallback.
+  return "raster";
+}
+
+export function getExternalClipboardHtml(
+  parts: readonly ExternalClipboardHtmlPart[],
+) {
+  if (!parts.length) {
+    return "";
+  }
+
+  const blocks = parts
+    .map((part) => {
+      if (part.kind === "text") {
+        return `<div style="white-space:pre-wrap;margin:0 0 12px 0;">${escapeClipboardHtml(part.text)}</div>`;
+      }
+
+      return `<img src="${escapeClipboardHtml(part.dataURL)}" width="${part.width}" height="${part.height}" style="display:block;max-width:100%;height:auto;margin:0 0 12px 0;" />`;
+    })
+    .join("");
+
+  return `<!doctype html><html><body><div>${blocks}</div></body></html>`;
 }
 
 export function collectInternalClipboardElements(
